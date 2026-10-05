@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.env
+
+# Claude Code's own local session/tool state -- not project code.
+.claude/
+
+# Generated at runtime by Guard/Offline and the fixture scripts -- includes
+# a disposable nested git repository (target_repo/) that must not be
+# tracked by the outer repo.
+offline_workspace/
