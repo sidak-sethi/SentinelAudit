@@ -24,7 +24,7 @@ from offline.auditor import SYSTEM_PROMPT, _untrusted_block, interpret_pytest_re
 from offline.events import emit
 from offline.sandbox import combined_output
 
-MAX_PATCH_ATTEMPTS = int(os.environ.get("MAX_PATCH_ATTEMPTS", "3"))
+MAX_PATCH_ATTEMPTS = int(os.environ.get("MAX_PATCH_ATTEMPTS", "1"))
 
 
 class PatchResult:

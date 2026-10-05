@@ -22,6 +22,7 @@ export type Finding = {
   reason: string | null
   timestamp: string
   patch_available?: boolean
+  push_result?: { status: string; branch?: string; remote?: string; message?: string }
 }
 
 export type BackendHealth = {
@@ -37,6 +38,43 @@ export type BackendEvent = {
   event: string
   status: string
   details: string
+}
+
+export type OnlineStatus = {
+  configured: boolean
+  provider: string
+  model: string
+  queued_count: number
+}
+
+export type OnlineAuditRecord = {
+  repository: string
+  status: string | null
+  patch_status: string | null
+  timestamp: string | null
+}
+
+export type OnlinePackage = {
+  threat_id: string
+  title: string
+  cve: string | null
+  severity: string
+  source: { type: string; url: string; published?: string; retrieved_at?: string }
+  affected_component: string
+  affected_versions: string[]
+  fixed_versions: string[]
+  description: string
+  remediation: string
+  queued_at: string
+  audits: OnlineAuditRecord[]
+}
+
+export type OnlineQueue = { queued_count: number; packages: OnlinePackage[] }
+export type OnlineCycleResult = {
+  cycle: { events: number; relevant: number; groups: number; processed_groups: number; pending_groups: number; failed: string[] }
+  guard: { status: string; threat_id: string | null; reason: string | null }[]
+  queued_count: number
+  message: string
 }
 
 type ApiErrorBody = { error?: string; message?: string; status?: string; [key: string]: unknown }
@@ -71,6 +109,12 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
 export const api = {
   health: () => request<BackendHealth>('/health'),
+  onlineStatus: () => request<OnlineStatus>('/online/status'),
+  onlineQueue: () => request<OnlineQueue>('/online/queue'),
+  onlineCycle: () => request<OnlineCycleResult>('/online/cycle', { method: 'POST' }),
+  auditOnlinePackage: (threatId: string, repository: string) => request<{ audit: Record<string, unknown>; repository: string }>(`/online/audit/${encodeURIComponent(threatId)}`, {
+    method: 'POST', body: JSON.stringify({ repository }),
+  }),
   findings: () => request<Finding[]>('/findings'),
   patchHistory: () => request<Finding[]>('/patch-history'),
   events: async () => {

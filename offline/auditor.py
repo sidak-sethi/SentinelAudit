@@ -50,7 +50,7 @@ Always respond with a single valid JSON object and nothing else."""
 class AuditResult:
     status: str  # "vulnerable" | "not_applicable" | "uncertain" | "ai_error"
     threat_id: str
-    confidence: float = 0.0
+    confidence: float | None = 0.0
     affected_files: list = field(default_factory=list)
     affected_lines: list = field(default_factory=list)
     reasoning: str = ""
@@ -237,7 +237,11 @@ def write_and_run_security_test(test_spec: dict) -> tuple:
     test_path = test_spec.get("test_file_path") or f"tests/security/test_generated{extension}"
     if not test_path.startswith("tests/security/"):
         test_path = f"tests/security/{test_path.rsplit('/', 1)[-1]}"
-    tools.write_file(test_path, test_spec.get("test_code", ""))
+    generated_code = test_spec.get("test_code", "")
+    marker = "# SentinelAudit generated security regression test\n" if extension == ".py" else "// SentinelAudit generated security regression test\n"
+    if not generated_code.startswith(marker):
+        generated_code = marker + generated_code
+    tools.write_file(test_path, generated_code)
     result = tools.run_security_test(test_path)
     outcome = interpret_pytest_result(result)
     return test_path, result, outcome
@@ -320,6 +324,10 @@ def run_audit(package_path, known_affected_files: list | None = None) -> AuditRe
             test_spec = generate_security_test(package, hypothesis, inspection, correction=correction)
         except (gemma_client.GemmaUnavailableError, gemma_client.GemmaResponseError) as exc:
             emit("OFFLINE_SECURITY_TEST_CREATED", "failure", str(exc))
+            # The first generated test is still present from the failed
+            # mechanical attempt. Do not leave it untracked in the target
+            # repository when the corrective model call cannot recover.
+            _discard_generated_test(test_path)
             return AuditResult(status="ai_error", threat_id=threat_id, reasoning=str(exc), package=package)
 
         test_path, test_result, outcome = write_and_run_security_test(test_spec)

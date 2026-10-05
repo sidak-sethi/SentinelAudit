@@ -1,0 +1,15 @@
+{
+  "event_id": "fixture:CVE-2099-0001",
+  "source": "fixture",
+  "source_type": "fixture",
+  "identifiers": {"CVE": ["CVE-2099-0001"], "GHSA": ["GHSA-fixture-0001"]},
+  "affected_technology": ["Python", "Flask"],
+  "affected_packages": ["fixturepkg"],
+  "affected_versions": ["1.0.0"],
+  "summary": "Synthetic Python package authorization vulnerability",
+  "description": "A fixture vulnerability used to exercise SentinelAudit research and verification without executing a real-world exploit.",
+  "evidence": [{"type": "fixture"}],
+  "references": ["https://example.invalid/CVE-2099-0001"],
+  "severity": "HIGH",
+  "cvss_score": 8.1
+}

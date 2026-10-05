@@ -2,6 +2,11 @@ __pycache__/
 *.pyc
 .pytest_cache/
 .env
+.venv/
+*.egg-info/
+build/
+dist/
+data/
 
 # Claude Code's own local session/tool state -- not project code.
 .claude/

@@ -40,6 +40,14 @@ def get_current_branch() -> str:
     return name or "main"
 
 
+def get_default_branch() -> str | None:
+    result = run_command(["git", "symbolic-ref", "--short", "refs/remotes/origin/HEAD"], cwd=_repo_path())
+    if result["returncode"] != 0:
+        return None
+    ref = result["stdout"].strip()
+    return ref.removeprefix("origin/") or None
+
+
 def create_fix_branch(threat_id: str) -> str:
     branch = f"ai-security-fix/{threat_id}"
     if not BRANCH_NAME_RE.match(branch):

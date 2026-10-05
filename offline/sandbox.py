@@ -11,7 +11,7 @@ import subprocess
 ALLOWED_PROGRAMS = {
     "pytest": None,
     "python": {"requires_args_prefix": ["-m", "pytest"]},
-    "git": {"subcommands": {"status", "diff", "checkout", "switch", "add", "commit"}},
+    "git": {"subcommands": {"status", "diff", "checkout", "switch", "add", "commit", "symbolic-ref"}},
     # "node <file>" runs exactly one script, no flags, no eval/require
     # chains on the command line -- the script's own content is still
     # path-and-content controlled the same way a pytest file is.

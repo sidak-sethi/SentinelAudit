@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { ChangeEvent, FormEvent } from 'react'
 import { api, ApiError } from './api'
-import type { BackendEvent, BackendHealth, Finding } from './api'
+import type { BackendEvent, BackendHealth, Finding, OnlineCycleResult, OnlinePackage, OnlineQueue, OnlineStatus } from './api'
 import './App.css'
 
 const sample: Finding = {
@@ -31,6 +31,7 @@ const finalAuditLabel = (value: Finding['final_audit']) => {
   return 'Pending'
 }
 const date = (value?: string | null) => value ? new Date(value).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' }) : '—'
+const repoLabel = (value: string) => value.split(/[\\/]/).filter(Boolean).pop() || value
 const sameFinding = (a: Finding, b: Finding) => a.threat_id === b.threat_id && a.repository === b.repository
 const mergePatchHistory = (backendHistory: Finding[], imported: Finding[]) => {
   const entries = [...backendHistory, ...imported.filter(item => item.patch_status)]
@@ -69,10 +70,18 @@ function App() {
   const [repoBusy, setRepoBusy] = useState(false)
   const [repoError, setRepoError] = useState('')
   const [fixBusy, setFixBusy] = useState(false)
+  const [fixCountdown, setFixCountdown] = useState<number | null>(null)
   const [fixError, setFixError] = useState('')
   const [backendStatus, setBackendStatus] = useState<'checking' | 'online' | 'offline'>('checking')
   const [backendHealth, setBackendHealth] = useState<BackendHealth | null>(null)
   const [backendEvents, setBackendEvents] = useState<BackendEvent[]>([])
+  const [onlineStatus, setOnlineStatus] = useState<OnlineStatus | null>(null)
+  const [onlineQueue, setOnlineQueue] = useState<OnlineQueue>({ queued_count: 0, packages: [] })
+  const [onlineBusy, setOnlineBusy] = useState(false)
+  const [onlineError, setOnlineError] = useState('')
+  const [onlineResult, setOnlineResult] = useState<OnlineCycleResult | null>(null)
+  const [onlineAuditBusy, setOnlineAuditBusy] = useState('')
+  const [auditRepository, setAuditRepository] = useState('')
   const fileRef = useRef<HTMLInputElement>(null)
   const save = (items: Finding[]) => { setFindings(items); localStorage.setItem('sentinelaudit-findings', JSON.stringify(items)) }
   const refreshBackendFindings = async () => {
@@ -82,6 +91,11 @@ function App() {
   }
   const refreshBackendEvents = async () => setBackendEvents(await api.events())
   const refreshBackendPatchHistory = async () => setPatchHistory(mergePatchHistory(await api.patchHistory(), readImported()))
+  const refreshOnline = async () => {
+    const [statusResult, queueResult] = await Promise.all([api.onlineStatus(), api.onlineQueue()])
+    setOnlineStatus(statusResult)
+    setOnlineQueue(queueResult)
+  }
   useEffect(() => {
     let mounted = true
     const checkBackend = async () => {
@@ -91,7 +105,7 @@ function App() {
           setBackendHealth(health)
           setBackendStatus('online')
         }
-        const [reportsResult, eventsResult, historyResult] = await Promise.allSettled([api.findings(), api.events(), api.patchHistory()])
+        const [reportsResult, eventsResult, historyResult, onlineResult] = await Promise.allSettled([api.findings(), api.events(), api.patchHistory(), Promise.all([api.onlineStatus(), api.onlineQueue()])])
         if (mounted && reportsResult.status === 'fulfilled') {
           const combined = combineWithImported(reportsResult.value)
           save(combined)
@@ -99,6 +113,10 @@ function App() {
         }
         if (mounted && eventsResult.status === 'fulfilled') setBackendEvents(eventsResult.value)
         if (mounted && historyResult.status === 'fulfilled') setPatchHistory(mergePatchHistory(historyResult.value, readImported()))
+        if (mounted && onlineResult.status === 'fulfilled') {
+          setOnlineStatus(onlineResult.value[0])
+          setOnlineQueue(onlineResult.value[1])
+        }
       } catch {
         if (mounted) { setBackendStatus('offline'); setBackendHealth(null) }
       }
@@ -110,6 +128,10 @@ function App() {
   const filtered = useMemo(() => findings.filter(f => (severity === 'all' || f.severity.toLowerCase() === severity) && (status === 'all' || f.status === status) && `${f.title} ${f.threat_id} ${f.attack_type} ${f.repository}`.toLowerCase().includes(query.toLowerCase())), [findings, query, severity, status])
   const patches = findings.filter(f => f.patch_status)
   const repositoriesCount = new Set(findings.map(f => f.repository).filter(Boolean)).size
+  const repositoryOptions = [...new Set([auditRepository, ...findings.map(f => f.repository)].filter(Boolean))]
+  useEffect(() => {
+    if (!repositoryOptions.includes(auditRepository)) setAuditRepository(repositoryOptions[0] || '')
+  }, [findings, auditRepository])
   const analyzedCount = findings.filter(f => f.status !== 'ai_error').length
   const patchAttemptsCount = findings.reduce((total, f) => total + (f.patch_attempts || 0), 0)
   const auditedCount = findings.filter(f => f.final_audit).length
@@ -154,6 +176,7 @@ function App() {
     setRepoBusy(true)
     try {
       const result = await api.scan(parsedUrl.href.replace(/\/$/, ''))
+      setAuditRepository(result.repository)
       setBackendStatus('online')
       setRepoUrl('')
       try { await refreshBackendFindings() } catch { save(mergeFindings(findings, result.findings)) }
@@ -168,24 +191,58 @@ function App() {
     finally { setRepoBusy(false) }
   }
   const submitFix = async (finding: Finding) => {
-    if (finding.status === 'guard_rejected' || finding.patch_status === 'fixed' || !finding.patch_available) return
-    const rechecking = finding.status !== 'confirmed'
-    const action = rechecking ? 'Recheck this finding and start patching only if the security audit confirms it' : 'Run the security patch workflow'
-    const approved = window.confirm(`${action} for “${finding.title}”? The backend will test and commit an accepted fix to a local branch. It will not push or open a pull request.`)
-    if (!approved) return
+    if (finding.status === 'guard_rejected' || (finding.patch_status === 'fixed' && finding.push_result?.status !== 'push_failed') || !finding.patch_available) return
     setActive(finding)
     setFixBusy(true); setFixError('')
+    setFixCountdown(20)
     try {
-      const updated = await api.fix(finding)
+      const request = api.fix(finding).then(value => ({ value }), error => ({ error }))
+      await new Promise<void>(resolve => {
+        let remaining = 20
+        const interval = window.setInterval(() => {
+          remaining -= 1
+          setFixCountdown(Math.max(remaining, 0))
+          if (remaining <= 0) { window.clearInterval(interval); resolve() }
+        }, 1000)
+      })
+      const result = await request
+      if ('error' in result) throw result.error
+      const updated = result.value
       setActive(updated)
       save(findings.map(f => sameFinding(f, updated) ? updated : f))
       try { await refreshBackendFindings() } catch { /* Keep the successful fix response visible. */ }
       void refreshBackendEvents().catch(() => undefined)
       void refreshBackendPatchHistory().catch(() => undefined)
-      setNotice(updated.status !== 'confirmed' ? `Recheck finished for ${updated.title}: ${pretty(updated.status)}. No patch was applied.` : updated.patch_status === 'fixed' ? `Patch verified for ${updated.title}.` : `Patch attempt finished for ${updated.title}: ${pretty(updated.patch_status || 'unresolved')}.`)
+      setNotice(updated.status !== 'confirmed' ? `Recheck finished for ${updated.title}: ${pretty(updated.status)}. No patch was applied.` : updated.patch_status === 'fixed' && updated.push_result?.status === 'pushed' ? `Patched successfully and pushed to GitHub for ${updated.title} on branch ${updated.branch}.` : updated.patch_status === 'fixed' ? `Patched locally, but the GitHub push failed: ${updated.push_result?.message || 'check repository write access and retry the push.'}` : `Patch attempt finished for ${updated.title}: ${pretty(updated.patch_status || 'unresolved')}. ${updated.reason || ''}`)
       setTimeout(() => setNotice(''), 5000)
     } catch (error) { setFixError(error instanceof Error ? error.message : 'The patch workflow failed.') }
-    finally { setFixBusy(false) }
+    finally { setFixBusy(false); setFixCountdown(null) }
+  }
+  const runOnlineCycle = async () => {
+    if (!window.confirm('Run one threat intelligence cycle? This contacts configured public security feeds and sends threat context to the configured LLM provider. Guard-approved packages enter the local queue; this action does not audit or patch a repository.')) return
+    setOnlineBusy(true); setOnlineError(''); setOnlineResult(null)
+    try {
+      const result = await api.onlineCycle()
+      setOnlineResult(result)
+      await refreshOnline()
+      void refreshBackendEvents().catch(() => undefined)
+    } catch (error) {
+      setOnlineError(error instanceof Error ? error.message : 'The Online cycle failed.')
+    } finally { setOnlineBusy(false) }
+  }
+  const auditOnlinePackage = async (item: OnlinePackage) => {
+    if (!auditRepository) { setOnlineError('Scan or select a repository before auditing queued threat packages.'); return }
+    const approved = window.confirm(`Audit “${item.title}” against ${repoLabel(auditRepository)}? If confirmed, the Offline workflow may apply and commit a tested fix to a local branch. It will not push changes.`)
+    if (!approved) return
+    setOnlineAuditBusy(item.threat_id); setOnlineError('')
+    try {
+      const result = await api.auditOnlinePackage(item.threat_id, auditRepository)
+      await Promise.all([refreshOnline(), refreshBackendFindings(), refreshBackendEvents(), refreshBackendPatchHistory()])
+      setNotice(`Threat audit finished for ${item.title}. Result: ${String(result.audit.audit_status || 'complete')}${result.audit.patch_status ? ` · patch ${String(result.audit.patch_status)}` : ''}.`)
+      setTimeout(() => setNotice(''), 6000)
+    } catch (error) {
+      setOnlineError(error instanceof Error ? error.message : 'The threat package audit failed.')
+    } finally { setOnlineAuditBusy('') }
   }
 
   return <div className="app-shell">
@@ -248,14 +305,40 @@ function App() {
               <div className="chart-foot">Patch success rate: {patches.length ? `${Math.round(patches.filter(f => f.patch_status === 'fixed').length / patches.length * 100)}%` : 'No attempts yet'}</div>
             </article>
           </section>
-          <section className="content-card repo-submit-card"><div className="repo-submit-copy"><span className="repo-submit-icon">{icon('arrow')}</span><div><h2>Scan a GitHub repository</h2><p>Submit a public GitHub URL. The backend makes a shallow local clone, then scans that checkout.</p></div></div><form className="repo-submit-form" onSubmit={submitRepository}><label className="repo-input-wrap"><span className="github-mark">GH</span><input type="url" value={repoUrl} onChange={e => setRepoUrl(e.target.value)} placeholder="https://github.com/owner/repository" aria-label="GitHub repository URL" required /></label><button className="button button-primary" disabled={repoBusy || backendStatus !== 'online'}>{repoBusy ? <><span className="spinner" /> Scanning…</> : 'Run security scan'}</button></form>{repoBusy && <p className="scan-progress" role="status">Cloning repository and running the local analysis. This can take a few minutes.</p>}{repoError && <p className="repo-error" role="alert">{repoError}</p>}<div className="endpoint-note">API <code>{import.meta.env.VITE_API_URL || 'Vite proxy → http://127.0.0.1:5001'}</code><span>·</span> The backend does not push changes or open pull requests from a scan.</div></section>
+          <section className="content-card online-card" aria-label="Online threat intelligence">
+            <div className="online-head">
+              <div><span className="eyebrow">THREAT INTELLIGENCE</span><h2>Online security research</h2><p>Collect public advisories, enrich and analyze relevant threats, then pass packages through Guard.</p></div>
+              <span className={`online-ready ${onlineStatus?.configured ? 'is-ready' : 'needs-key'}`}>{onlineStatus?.configured ? `${pretty(onlineStatus.provider)} ready` : onlineStatus ? 'LLM key needed' : 'Checking setup'}</span>
+            </div>
+            <div className="online-controls">
+              <div><strong>{onlineQueue.queued_count} Guard-approved package{onlineQueue.queued_count === 1 ? '' : 's'}</strong><small>{onlineStatus?.configured ? `${onlineStatus.model} · one cycle at a time` : 'Add LLM_API_KEY to the local .env to enable live analysis.'}</small></div>
+              <button className="button button-primary" onClick={() => void runOnlineCycle()} disabled={onlineBusy || backendStatus !== 'online' || !onlineStatus?.configured}>{onlineBusy ? <><span className="spinner" /> Researching…</> : 'Run intelligence cycle'}</button>
+            </div>
+            {onlineBusy && <p className="online-note" role="status">Fetching sources, triaging candidates, and researching up to the configured per-cycle limit. Live cycles may take a few minutes.</p>}
+            {onlineError && <p className="repo-error" role="alert">{onlineError}</p>}
+            {onlineResult && <div className="online-result" role="status"><strong>Cycle complete</strong><span>{onlineResult.cycle.events} events · {onlineResult.cycle.relevant} relevant · {onlineResult.cycle.processed_groups} groups processed</span><span>{onlineResult.guard.filter(item => item.status === 'APPROVED').length} approved · {onlineResult.guard.filter(item => item.status === 'REJECTED').length} rejected by Guard</span></div>}
+            {onlineQueue.packages.length > 0 && <>
+              <div className="online-queue-heading"><div><h3>Local audit queue</h3><p>Guard-approved reports are waiting for a repository-specific audit.</p></div><label>Target repository<select value={auditRepository} onChange={event => setAuditRepository(event.target.value)}><option value="">Select a scanned repository</option>{repositoryOptions.map(repository => <option key={repository} value={repository}>{repoLabel(repository)}</option>)}</select></label></div>
+              <div className="online-package-list">{onlineQueue.packages.slice(0, 6).map(item => {
+                const audit = item.audits.find(entry => entry.repository === auditRepository)
+                return <article className="online-package" key={item.threat_id}>
+                  <div className="online-package-main"><div className="online-package-title"><strong>{item.title}</strong><span className={`severity severity-${item.severity.toLowerCase()}`}><i />{pretty(item.severity)}</span></div><div className="online-package-meta"><span>{item.cve || item.threat_id}</span><span>{item.affected_component}{item.affected_versions.length ? ` · ${item.affected_versions.join(', ')}` : ''}</span><a href={item.source.url} target="_blank" rel="noreferrer">{pretty(item.source.type)} source {icon('arrow')}</a></div><p>{item.description}</p></div>
+                  <div className="online-package-action">{audit && (audit.patch_status || audit.status === 'confirmed') ? <span className={`status status-${audit.patch_status || audit.status || 'uncertain'}`}>{audit.patch_status ? `${pretty(audit.patch_status)} patch` : `${pretty(audit.status || 'audited')}`}</span> : <button className="button button-outline" onClick={() => void auditOnlinePackage(item)} disabled={!auditRepository || onlineAuditBusy === item.threat_id || backendStatus !== 'online'}>{onlineAuditBusy === item.threat_id ? <><span className="spinner spinner-dark" /> Auditing…</> : audit ? 'Recheck audit' : 'Audit & patch'}</button>}</div>
+                </article>
+              })}</div>
+              {onlineQueue.packages.length > 6 && <div className="online-note">Showing 6 of {onlineQueue.packages.length} queued packages.</div>}
+            </>}
+            {onlineQueue.packages.length === 0 && <div className="online-empty">No Guard-approved threat packages are waiting. Run an intelligence cycle to collect current source data.</div>}
+            <div className="endpoint-note">Each live cycle contacts configured public sources and your configured LLM provider. Threat content remains untrusted data; Guard validates every package before it reaches the local audit queue.</div>
+          </section>
+          <section className="content-card repo-submit-card"><div className="repo-submit-copy"><span className="repo-submit-icon">{icon('arrow')}</span><div><h2>Scan a GitHub repository</h2><p>Submit a public GitHub URL. The backend makes a shallow local clone, then runs a quick candidate scan.</p></div></div><form className="repo-submit-form" onSubmit={submitRepository}><label className="repo-input-wrap"><span className="github-mark">GH</span><input type="url" value={repoUrl} onChange={e => setRepoUrl(e.target.value)} placeholder="https://github.com/owner/repository" aria-label="GitHub repository URL" required /></label><button className="button button-primary" disabled={repoBusy || backendStatus !== 'online'}>{repoBusy ? <><span className="spinner" /> Scanning…</> : 'Run security scan'}</button></form>{repoBusy && <p className="scan-progress" role="status">Cloning if needed, then making one candidate pass. Proof checks run when you choose Recheck &amp; push.</p>}{repoError && <p className="repo-error" role="alert">{repoError}</p>}<div className="endpoint-note">API <code>{import.meta.env.VITE_API_URL || 'Vite proxy → http://127.0.0.1:5001'}</code><span>·</span> Patch actions use prepared local rules for supported patterns, then push only the validated fix branch; scans alone never push.</div></section>
           </>}
           {section === 'findings' && <>
           <section className="findings-summary"><div><span>All findings</span><strong>{findings.length}</strong></div><div><span>Needs review</span><strong>{findings.filter(f => ['ai_error', 'uncertain', 'guard_rejected'].includes(f.status)).length}</strong></div><div><span>Patch attempts</span><strong>{patchAttemptsCount}</strong></div><div><span>Successfully patched</span><strong>{findings.filter(f => f.patch_status === 'fixed').length}</strong></div></section>
           <section className="content-card findings-card">
-            <div className="card-heading"><div><h2>All vulnerabilities</h2><p>Filter and inspect imported security findings</p></div></div>
+            <div className="card-heading"><div><h2>All vulnerabilities</h2><p>Review scan candidates and start proof checks only when needed</p></div></div>
             <div className="filters"><label className="search-box">{icon('search')}<input value={query} onChange={e => setQuery(e.target.value)} placeholder="Search findings, IDs, repositories..." /></label><select aria-label="Filter severity" value={severity} onChange={e => setSeverity(e.target.value)}><option value="all">All severities</option>{['critical', 'high', 'medium', 'low'].map(v => <option key={v} value={v}>{v[0].toUpperCase() + v.slice(1)}</option>)}</select><select aria-label="Filter status" value={status} onChange={e => setStatus(e.target.value)}><option value="all">All statuses</option>{['confirmed', 'not_applicable', 'uncertain', 'ai_error', 'guard_rejected'].map(v => <option key={v} value={v}>{pretty(v)}</option>)}</select></div>
-            <div className="table-wrap"><table><thead><tr><th>VULNERABILITY</th><th>SEVERITY</th><th>AI REVIEW</th><th>PATCH STATUS</th><th>REPOSITORY</th><th>LAST DETECTED</th><th>PATCH ACTION</th></tr></thead><tbody>{filtered.map(f => <tr key={`${f.repository}:${f.threat_id}`} onClick={() => setActive(f)} tabIndex={0} onKeyDown={e => e.key === 'Enter' && setActive(f)}><td><div className="finding-title">{f.title}</div><div className="finding-id">{f.cve || f.threat_id}</div></td><td><span className={`severity severity-${f.severity.toLowerCase()}`}><i />{pretty(f.severity)}</span></td><td><span className={`status status-${f.status}`}>{pretty(f.status)}</span></td><td>{f.patch_status ? <span className={`status status-${f.patch_status}`}>{pretty(f.patch_status)}</span> : <span className="muted">Not attempted</span>}</td><td><span className="repo-name">{f.repository.split(/[\\/]/).filter(Boolean).pop() || 'Unknown repository'}</span></td><td className="date-cell">{date(f.timestamp)}</td><td>{f.patch_status !== 'fixed' && f.patch_available && f.status !== 'guard_rejected' ? <button className="button button-primary row-patch-button" disabled={fixBusy || backendStatus !== 'online'} onClick={event => { event.stopPropagation(); void submitFix(f) }}>{fixBusy ? 'Working…' : f.status === 'confirmed' ? f.patch_status === 'unresolved' ? 'Retry patch' : 'Start patch' : 'Recheck & patch'}</button> : f.status === 'guard_rejected' ? <span className="muted" title="Guard-rejected findings cannot enter the patch workflow">Guard blocked</span> : ['confirmed', 'ai_error', 'uncertain', 'not_applicable'].includes(f.status) && f.patch_status !== 'fixed' ? <span className="muted" title="Run a fresh scan with this backend to recheck this finding">Rescan to enable</span> : <span className="muted">—</span>}</td></tr>)}</tbody></table>{filtered.length === 0 && <div className="empty-state">{findings.length ? 'No findings match these filters.' : 'No findings yet. Import a JSON scan to get started.'}</div>}</div>
+            <div className="table-wrap"><table><thead><tr><th>VULNERABILITY</th><th>SEVERITY</th><th>PATCH STATUS</th><th>REPOSITORY</th><th>LAST DETECTED</th><th>PATCH ACTION</th></tr></thead><tbody>{filtered.map(f => <tr key={`${f.repository}:${f.threat_id}`} onClick={() => setActive(f)} tabIndex={0} onKeyDown={e => e.key === 'Enter' && setActive(f)}><td><div className="finding-title">{f.title}</div><div className="finding-id">{f.cve || f.threat_id}</div></td><td><span className={`severity severity-${f.severity.toLowerCase()}`}><i />{pretty(f.severity)}</span></td><td>{f.patch_status ? <span className={`status status-${f.patch_status}`}>{pretty(f.patch_status)}</span> : <span className="muted">Not attempted</span>}</td><td><span className="repo-name">{f.repository.split(/[\\/]/).filter(Boolean).pop() || 'Unknown repository'}</span></td><td className="date-cell">{date(f.timestamp)}</td><td>{(f.patch_status !== 'fixed' || f.push_result?.status === 'push_failed') && f.patch_available && f.status !== 'guard_rejected' ? <button className="button button-primary row-patch-button" disabled={fixBusy || backendStatus !== 'online'} onClick={event => { event.stopPropagation(); void submitFix(f) }}>{fixBusy ? fixCountdown ? `Patching… ${fixCountdown}s` : 'Waiting for GitHub confirmation…' : f.patch_status === 'fixed' ? 'Retry push' : f.status === 'confirmed' ? f.patch_status === 'unresolved' ? 'Retry & push' : 'Apply & push' : 'Recheck & push'}</button> : f.status === 'guard_rejected' ? <span className="muted" title="Guard-rejected findings cannot enter the patch workflow">Guard blocked</span> : ['confirmed', 'ai_error', 'uncertain', 'not_applicable'].includes(f.status) && f.patch_status !== 'fixed' ? <span className="muted" title="Run a fresh scan with this backend to recheck this finding">Rescan to enable</span> : <span className="muted">—</span>}</td></tr>)}</tbody></table>{filtered.length === 0 && <div className="empty-state">{findings.length ? 'No findings match these filters.' : 'No findings yet. Import a JSON scan to get started.'}</div>}</div>
             <div className="table-footer">Showing <strong>{filtered.length}</strong> of <strong>{findings.length}</strong> findings<span>Data stored locally in this browser</span></div>
           </section>
           </>}
@@ -267,7 +350,7 @@ function App() {
       </div>
     </main>
 
-    {active && <div className="modal-backdrop" onMouseDown={e => e.target === e.currentTarget && setActive(null)}><aside className="detail-panel" role="dialog" aria-modal="true" aria-label={`Finding details: ${active.title}`}><div className="detail-header"><div><div className="eyebrow">VULNERABILITY DETAIL</div><h2>{active.title}</h2></div><button className="icon-button" aria-label="Close details" onClick={() => { setActive(null); setFixError('') }}>{icon('close')}</button></div><div className="detail-scroll"><div className="detail-badges"><span className={`severity severity-${active.severity.toLowerCase()}`}><i />{pretty(active.severity)}</span><span className={`status status-${active.status}`}>{pretty(active.status)}</span></div><div className="detail-id">{active.threat_id}</div><section className="detail-section"><h3>Finding overview</h3><dl><div><dt>Attack type</dt><dd>{pretty(active.attack_type)}</dd></div><div><dt>CVE</dt><dd>{active.cve || 'Not assigned'}</dd></div><div><dt>Confidence</dt><dd>{Math.round((active.confidence ?? 0) * 100)}%</dd></div><div><dt>Repository</dt><dd className="wrap-value">{active.repository || '—'}</dd></div><div><dt>Detected</dt><dd>{date(active.timestamp)}</dd></div></dl></section><section className="detail-section"><h3>Source</h3><dl><div><dt>Type</dt><dd>{pretty(active.source?.type || 'unknown')}</dd></div><div><dt>Published</dt><dd>{date(active.source?.published)}</dd></div><div><dt>Retrieved</dt><dd>{date(active.source?.retrieved_at)}</dd></div></dl><a className="detail-link" href={active.source?.url} target="_blank" rel="noreferrer">{active.source?.url || 'No source URL'} {icon('arrow')}</a></section><section className="detail-section"><h3>Reverse engineering</h3><p className="detail-paragraph">{active.vulnerability_hypothesis || 'No hypothesis provided.'}</p>{active.reason && <div className="reason-box"><strong>Review note</strong><p>{active.reason}</p></div>}<div className="recommendation"><strong>Recommended fix</strong><p>{active.recommended_fix || 'No recommendation provided.'}</p></div></section><section className="detail-section"><h3>Affected areas</h3>{active.affected_files?.length ? <ul className="file-list">{active.affected_files.map((file, i) => <li key={file}>{icon('file')}<span>{file}</span>{active.affected_lines?.[i] && <code>:{active.affected_lines[i]}</code>}</li>)}</ul> : <p className="muted detail-paragraph">No affected files or lines were reported.</p>}{active.security_test_path && <div className="test-path">Security test <code>{active.security_test_path}</code></div>}</section><section className="detail-section"><h3>Patching result</h3><dl><div><dt>Status</dt><dd>{active.patch_status ? pretty(active.patch_status) : 'Not attempted'}</dd></div><div><dt>Attempts</dt><dd>{active.patch_attempts}</dd></div><div><dt>Branch</dt><dd className="wrap-value">{active.branch || '—'}</dd></div><div><dt>Final audit</dt><dd>{finalAuditLabel(active.final_audit)}</dd></div></dl>{active.final_audit && typeof active.final_audit === 'object' && <div className="reason-box"><strong>Final audit reasoning</strong><p>{active.final_audit.reasoning || active.final_audit.recommendation || 'No additional audit details.'}</p></div>}{active.diff ? <pre className="diff-block">{active.diff}</pre> : <p className="muted detail-paragraph">No patch diff available.</p>}{Object.entries(active.code || {}).map(([path, value]) => <div className="code-change" key={path}><strong>{path}</strong><pre>{value.before}{value.after ? `\n\nAfter:\n${value.after}` : ''}</pre></div>)}{active.status === 'guard_rejected' ? <p className="reason-box">The Guard rejected this finding, so it cannot enter the patch workflow.</p> : active.patch_status !== 'fixed' && (active.patch_available ? <div className="fix-controls"><button className="button button-primary" onClick={() => void submitFix(active)} disabled={fixBusy || backendStatus !== 'online'}>{fixBusy ? <><span className="spinner" /> Rechecking &amp; patching…</> : active.status === 'confirmed' ? active.patch_status === 'unresolved' ? 'Approve retry patch' : 'Approve & run patch workflow' : 'Recheck & patch'}</button><p>{active.status === 'confirmed' ? 'The backend creates a local fix branch only after tests and audit pass. Nothing is pushed.' : 'The backend repeats the security audit first. It starts patching only if the new audit confirms the vulnerability.'}</p>{fixError && <p className="repo-error" role="alert">{fixError}</p>}</div> : ['confirmed', 'ai_error', 'uncertain', 'not_applicable'].includes(active.status) && active.patch_status !== 'fixed' ? <p className="reason-box">Run a fresh scan with this backend to enable rechecking this finding.</p> : null)}</section></div></aside></div>}
+    {active && <div className="modal-backdrop" onMouseDown={e => e.target === e.currentTarget && setActive(null)}><aside className="detail-panel" role="dialog" aria-modal="true" aria-label={`Finding details: ${active.title}`}><div className="detail-header"><div><div className="eyebrow">VULNERABILITY DETAIL</div><h2>{active.title}</h2></div><button className="icon-button" aria-label="Close details" onClick={() => { setActive(null); setFixError('') }}>{icon('close')}</button></div><div className="detail-scroll"><div className="detail-badges"><span className={`severity severity-${active.severity.toLowerCase()}`}><i />{pretty(active.severity)}</span><span className={`status status-${active.status}`}>{pretty(active.status)}</span></div><div className="detail-id">{active.threat_id}</div><section className="detail-section"><h3>Finding overview</h3><dl><div><dt>Attack type</dt><dd>{pretty(active.attack_type)}</dd></div><div><dt>CVE</dt><dd>{active.cve || 'Not assigned'}</dd></div><div><dt>Confidence</dt><dd>{active.confidence == null ? "Not reviewed" : `${Math.round(active.confidence * 100)}%`}</dd></div><div><dt>Repository</dt><dd className="wrap-value">{active.repository || '—'}</dd></div><div><dt>Detected</dt><dd>{date(active.timestamp)}</dd></div></dl></section><section className="detail-section"><h3>Source</h3><dl><div><dt>Type</dt><dd>{pretty(active.source?.type || 'unknown')}</dd></div><div><dt>Published</dt><dd>{date(active.source?.published)}</dd></div><div><dt>Retrieved</dt><dd>{date(active.source?.retrieved_at)}</dd></div></dl><a className="detail-link" href={active.source?.url} target="_blank" rel="noreferrer">{active.source?.url || 'No source URL'} {icon('arrow')}</a></section><section className="detail-section"><h3>Reverse engineering</h3><p className="detail-paragraph">{active.vulnerability_hypothesis || 'No hypothesis provided.'}</p>{active.reason && <div className="reason-box"><strong>Review note</strong><p>{active.reason}</p></div>}<div className="recommendation"><strong>Recommended fix</strong><p>{active.recommended_fix || 'No recommendation provided.'}</p></div></section><section className="detail-section"><h3>Affected areas</h3>{active.affected_files?.length ? <ul className="file-list">{active.affected_files.map((file, i) => <li key={file}>{icon('file')}<span>{file}</span>{active.affected_lines?.[i] && <code>:{active.affected_lines[i]}</code>}</li>)}</ul> : <p className="muted detail-paragraph">No affected files or lines were reported.</p>}{active.security_test_path && <div className="test-path">Security test <code>{active.security_test_path}</code></div>}</section><section className="detail-section"><h3>Patching result</h3><dl><div><dt>Status</dt><dd>{active.patch_status ? pretty(active.patch_status) : 'Not attempted'}</dd></div><div><dt>Attempts</dt><dd>{active.patch_attempts}</dd></div><div><dt>Branch</dt><dd className="wrap-value">{active.branch || '—'}</dd></div><div><dt>Push result</dt><dd>{active.push_result ? `${pretty(active.push_result.status)}${active.push_result.message ? ` · ${active.push_result.message}` : ''}` : 'Not attempted'}</dd></div><div><dt>Final audit</dt><dd>{finalAuditLabel(active.final_audit)}</dd></div></dl>{active.final_audit && typeof active.final_audit === 'object' && <div className="reason-box"><strong>Final audit reasoning</strong><p>{active.final_audit.reasoning || active.final_audit.recommendation || 'No additional audit details.'}</p></div>}{active.diff ? <pre className="diff-block">{active.diff}</pre> : <p className="muted detail-paragraph">No patch diff available.</p>}{Object.entries(active.code || {}).map(([path, value]) => <div className="code-change" key={path}><strong>{path}</strong><pre>{value.before}{value.after ? `\n\nAfter:\n${value.after}` : ''}</pre></div>)}{active.status === 'guard_rejected' ? <p className="reason-box">The Guard rejected this finding, so it cannot enter the patch workflow.</p> : (active.patch_status !== 'fixed' || active.push_result?.status === 'push_failed') && (active.patch_available ? <div className="fix-controls"><button className="button button-primary" onClick={() => void submitFix(active)} disabled={fixBusy || backendStatus !== 'online'}>{fixBusy ? <><span className="spinner" /> {fixCountdown ? <>Patching &amp; pushing… {fixCountdown}s</> : <>Waiting for GitHub confirmation…</>}</> : active.patch_status === 'fixed' ? 'Retry push' : active.status === 'confirmed' ? active.patch_status === 'unresolved' ? 'Retry & push' : 'Apply & push' : 'Recheck & push'}</button><p>{active.status === 'confirmed' ? 'Uses a prepared, rule-based local fix template for supported issues (currently hardcoded secrets and SQLite SQL injection). After tests pass, the fix branch is pushed to the GitHub repository URL entered for this scan; no default branch is changed.' : 'Rechecks this finding first. If confirmed, a matching prepared local template (currently hardcoded secrets and SQLite SQL injection) is tested and its fix branch is pushed to the GitHub repository URL entered for this scan.'}</p>{fixError && <p className="repo-error" role="alert">{fixError}</p>}</div> : ['confirmed', 'ai_error', 'uncertain', 'not_applicable'].includes(active.status) && active.patch_status !== 'fixed' ? <p className="reason-box">Run a fresh scan with this backend to enable rechecking this finding.</p> : null)}</section></div></aside></div>}
   </div>
 }
 

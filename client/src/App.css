@@ -459,3 +459,52 @@ td { font-size:13px; }
   .event-copy strong { font-size:12px; }
   .event-copy small { font-size:11px; }
 }
+
+/* Online threat intelligence and Guard queue */
+.online-card{padding:21px 22px;margin-bottom:16px;background:#fff}
+.online-head{display:flex;align-items:flex-start;justify-content:space-between;gap:18px}
+.online-head h2{margin:6px 0;color:#202124;font:600 19px Manrope,sans-serif;letter-spacing:-.35px}
+.online-head p,.online-queue-heading p{margin:0;color:#687078;font-size:13px;line-height:1.5}
+.online-ready{padding:6px 10px;border-radius:999px;font-size:12px;font-weight:600;white-space:nowrap}
+.online-ready.is-ready{background:#e6f4ea;color:#137333}
+.online-ready.needs-key{background:#fff4e5;color:#996000}
+.online-controls{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-top:17px;padding:14px 0;border-top:1px solid #edf0f4;border-bottom:1px solid #edf0f4}
+.online-controls strong,.online-controls small{display:block}
+.online-controls strong{color:#30343a;font-size:14px}
+.online-controls small{margin-top:4px;color:#707981;font-size:12px}
+.online-note{margin:11px 0 0;color:#687078;font-size:12px;line-height:1.55}
+.online-result{display:flex;flex-wrap:wrap;gap:8px 18px;margin-top:13px;padding:11px 13px;border-radius:9px;background:#f2f7fd;color:#465363;font-size:12px}
+.online-result strong{color:#174ea6}
+.online-queue-heading{display:flex;align-items:flex-end;justify-content:space-between;gap:20px;margin:19px 0 11px}
+.online-queue-heading h3{margin:0 0 4px;color:#30343a;font-size:15px}
+.online-queue-heading label{display:grid;gap:5px;min-width:210px;color:#687078;font-size:11px;font-weight:600}
+.online-queue-heading select{max-width:280px;height:35px;padding:0 10px;border:1px solid #d7dde5;border-radius:8px;background:#fff;color:#30343a;font-size:12px}
+.online-package-list{display:grid;gap:8px}
+.online-package{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:13px 14px;border:1px solid #e8edf3;border-radius:10px;background:#fff}
+.online-package-main{min-width:0;flex:1}
+.online-package-title{display:flex;align-items:center;flex-wrap:wrap;gap:8px}
+.online-package-title>strong{color:#30343a;font-size:14px}
+.online-package-title .severity{font-size:11px}
+.online-package-meta{display:flex;flex-wrap:wrap;gap:5px 13px;margin-top:6px;color:#737d87;font-size:11px}
+.online-package-meta a{display:inline-flex;align-items:center;gap:3px;color:#1a73e8;text-decoration:none}
+.online-package-meta a:hover{text-decoration:underline}
+.online-package-meta .icon{width:12px;height:12px}
+.online-package-main>p{margin:8px 0 0;color:#66717b;font-size:12px;line-height:1.5}
+.online-package-action{flex:0 0 auto}
+.online-package-action .button{height:34px;padding:0 12px;font-size:12px}
+.online-package-action .status{white-space:nowrap}
+.online-empty{padding:19px 12px;color:#7b858e;text-align:center;font-size:12px}
+.spinner-dark{border-color:#8999aa55;border-top-color:#3d5268}
+@media(max-width:760px){
+  .online-card{padding:16px 14px}
+  .online-head{gap:9px;flex-direction:column}
+  .online-head h2{font-size:17px}
+  .online-head p{font-size:12px}
+  .online-controls{align-items:flex-start;flex-direction:column}
+  .online-controls .button{width:100%}
+  .online-queue-heading{align-items:stretch;flex-direction:column;gap:11px}
+  .online-queue-heading label,.online-queue-heading select{width:100%;max-width:none}
+  .online-package{align-items:flex-start;flex-direction:column}
+  .online-package-action{align-self:flex-end}
+  .online-result{flex-direction:column;gap:5px}
+}

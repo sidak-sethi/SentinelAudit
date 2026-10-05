@@ -16,7 +16,7 @@ from pathlib import Path
 
 from communication import paths
 from guard.guard import process_package_bytes
-from offline import auditor, languages, patcher, reports, repository, scanner
+from offline import auditor, languages, patcher, prepared_patcher, reports, repository, scanner
 
 # The branch select_repo()/init_git_repo() found the repo on, remembered
 # so apply_fix() can always cut a fix branch from the TRUE base -- not
@@ -25,6 +25,7 @@ from offline import auditor, languages, patcher, reports, repository, scanner
 # ai-security-fix/<id> branch; without this, a second fix in the same
 # session would branch off the first fix instead of off the real base).
 _base_branch: str | None = None
+_base_branch_repo: str | None = None
 
 
 @dataclass
@@ -49,7 +50,7 @@ class ScanFinding:
     package: dict
     status: str
     reason: str
-    audit: object = None  # auditor.AuditResult, when the proof step ran
+    audit: object = None  # proof result, or deferred-audit context for HTTP scans
 
 
 def select_repo(path) -> RepoSelection:
@@ -57,18 +58,55 @@ def select_repo(path) -> RepoSelection:
     git or touches the worktree itself -- it only reports what state the
     repo is in so the caller (cli.py) can decide, with the user's
     explicit confirmation, what to do about it."""
-    global _base_branch
+    global _base_branch, _base_branch_repo
     resolved = paths.set_target_repo(path)
+    repo_key = str(resolved)
     language = languages.detect_unsupported_language(resolved)
     if language is not None:
         return RepoSelection(status="unsupported_language", path=resolved, detail=language)
     if not repository.verify_git_repository():
         _base_branch = None
+        _base_branch_repo = repo_key
         return RepoSelection(status="needs_git_init", path=resolved)
+    cleanup_generated_security_tests(resolved)
     if not repository.verify_clean_worktree():
         return RepoSelection(status="dirty_worktree", path=resolved)
-    _base_branch = repository.get_current_branch()
+    if _base_branch_repo != repo_key or _base_branch is None:
+        current = repository.get_current_branch()
+        default_branch = repository.get_default_branch()
+        _base_branch = default_branch or (current if not current.startswith("ai-security-fix/") else None)
+        _base_branch_repo = repo_key
     return RepoSelection(status="ready", path=resolved)
+
+
+def cleanup_generated_security_tests(repo_path) -> None:
+    """Remove only untracked audit tests carrying the generator marker.
+
+    Test files are temporary evidence for an audit. A process restart or an
+    unsupported patch template must not leave those artifacts blocking the
+    next scan, while unrelated user files remain untouched.
+    """
+    import subprocess
+
+    repo = Path(repo_path)
+    result = subprocess.run(
+        ["git", "ls-files", "--others", "--exclude-standard", "-z"],
+        cwd=str(repo), capture_output=True, text=True, timeout=15,
+    )
+    if result.returncode != 0:
+        return
+    marker = "SentinelAudit generated security regression test"
+    for raw_path in result.stdout.split("\0"):
+        relative = raw_path.replace("\\", "/")
+        if not relative.startswith("tests/security/"):
+            continue
+        try:
+            target = (repo / raw_path).resolve(strict=True)
+            target.relative_to(repo.resolve())
+            if target.is_file() and marker in target.read_text(encoding="utf-8", errors="replace")[:512]:
+                target.unlink()
+        except (OSError, ValueError):
+            continue
 
 
 def init_git_repo() -> None:
@@ -83,7 +121,7 @@ def init_git_repo() -> None:
     can invoke autonomously (it never calls "git init"); it is not a
     blanket restriction on every git operation in this codebase.
     """
-    global _base_branch
+    global _base_branch, _base_branch_repo
     import subprocess
     repo = paths.TARGET_REPO
     subprocess.run(["git", "init"], cwd=str(repo), check=True, capture_output=True, text=True)
@@ -101,14 +139,16 @@ def init_git_repo() -> None:
         cwd=str(repo), check=True, capture_output=True, text=True,
     )
     _base_branch = repository.get_current_branch()
+    _base_branch_repo = str(repo.resolve())
 
 
-def find_vulnerabilities(repo_path=None) -> list:
+def find_vulnerabilities(repo_path=None, verify_findings: bool = True) -> list:
     """Scan the (already-selected, or newly selected if repo_path is
     given) repository, turn every raw Gemma finding into a signed
-    synthetic threat package, push it through the Guard exactly like an
-    Online-sourced package, and -- for every one the Guard approves --
-    run the real auditor.run_audit() proof step.
+    synthetic threat package and push it through the Guard exactly like
+    an Online-sourced package. `verify_findings=False` keeps dashboard
+    scans quick by deferring the real auditor.run_audit() proof step until
+    a user asks to recheck and patch an individual candidate.
 
     Returns a ScanFinding for EVERY lead Gemma proposed, whatever happened
     to it -- nothing is dropped. Only entries with status == "confirmed"
@@ -118,8 +158,9 @@ def find_vulnerabilities(repo_path=None) -> list:
     instead of a bare "nothing confirmed"."""
     if repo_path is not None:
         paths.set_target_repo(repo_path)
-        global _base_branch
+        global _base_branch, _base_branch_repo
         _base_branch = repository.get_current_branch() if repository.verify_git_repository() else None
+        _base_branch_repo = str(paths.TARGET_REPO.resolve())
     paths.ensure_directories()
 
     # A previous apply_fix() in this session may have left the worktree
@@ -148,21 +189,34 @@ def find_vulnerabilities(repo_path=None) -> list:
             ))
             continue  # even a self-generated finding must pass the Guard
 
-        package_path = paths.OFFLINE_INBOX / f"{package['threat_id']}.json"
-        # The scan already named the affected file(s) -- read them
-        # directly rather than hoping a freshly-guessed search pattern
-        # happens to match the same content again.
-        audit_result = auditor.run_audit(package_path, known_affected_files=finding.get("affected_files"))
-        status = "confirmed" if audit_result.status == "vulnerable" else audit_result.status
+        if verify_findings:
+            package_path = paths.OFFLINE_INBOX / f"{package['threat_id']}.json"
+            # The scan already named the affected file(s) -- read them
+            # directly rather than hoping a freshly-guessed search pattern
+            # happens to match the same content again.
+            audit_result = auditor.run_audit(package_path, known_affected_files=finding.get("affected_files"))
+            status = "confirmed" if audit_result.status == "vulnerable" else audit_result.status
 
-        if status == "confirmed":
-            # Commit just this finding's generated test, by exact path --
-            # not `git add -A`, which would also sweep up any other
-            # confirmed finding's still-pending test from this same scan.
-            # This is what keeps the worktree clean between findings
-            # (fixing the "dirty_worktree on next scan" issue) and keeps
-            # each fix's eventual diff limited to its own patch.
-            repository.commit_path(audit_result.test_path, f"Add security regression test for {audit_result.threat_id}")
+            if status == "confirmed":
+                # Commit just this finding's generated test, by exact path --
+                # not `git add -A`, which would also sweep up any other
+                # confirmed finding's still-pending test from this same scan.
+                # This keeps the worktree clean between findings and each
+                # fix's eventual diff limited to its own patch.
+                repository.commit_path(audit_result.test_path, f"Add security regression test for {audit_result.threat_id}")
+        else:
+            # Preserve the normal report shape and patch cache while making
+            # clear that this candidate has not yet passed a proof test.
+            status = "uncertain"
+            audit_result = auditor.AuditResult(
+                status=status,
+                threat_id=package["threat_id"],
+                confidence=None,
+                reasoning="Fast scan candidate; a proof audit runs when you select Recheck & patch.",
+                package=package,
+                affected_files=list(finding.get("affected_files") or []),
+                affected_lines=list(finding.get("affected_lines") or []),
+            )
 
         scan_finding = ScanFinding(
             raw=finding, package=package, status=status,
@@ -211,6 +265,67 @@ def apply_fix(audit_result):
     reports.write_run_report([enriched], full_rescan=False)
     reports.append_patch_history(enriched)
     return patch_result
+
+
+def apply_prepared_fix(audit_result, expected_remote: str):
+    """Apply a matching local template, validate and commit it, then push
+    only its fix branch to the exact GitHub repository entered at scan time."""
+    import subprocess
+
+    repo = Path(paths.TARGET_REPO)
+    actual = subprocess.run(
+        ["git", "remote", "get-url", "origin"], cwd=str(repo),
+        capture_output=True, text=True, timeout=15,
+    )
+    if actual.returncode != 0 or _normalize_remote(actual.stdout.strip()) != _normalize_remote(expected_remote):
+        raise repository.GitSafetyError("The repository origin no longer matches the GitHub URL submitted for this scan.")
+
+    result = prepared_patcher.run_prepared_patch(audit_result, base_branch=_base_branch)
+    push_result = {"status": "not_pushed"}
+    if result.status == "fixed":
+        push_result = push_fix_branch(result.branch, expected_remote, repo)
+
+    enriched = reports.build_finding_report(
+        package=audit_result.package or {}, status="confirmed",
+        reason=audit_result.reasoning, audit=audit_result, patch_result=result,
+    )
+    enriched["push_result"] = push_result
+    reports.write_run_report([enriched], full_rescan=False)
+    reports.append_patch_history(enriched)
+    return result, push_result
+
+
+def push_fix_branch(branch: str, expected_remote: str, repo_path=None) -> dict:
+    import os
+    import subprocess
+
+    repo = Path(repo_path) if repo_path else Path(paths.TARGET_REPO)
+    actual = subprocess.run(
+        ["git", "remote", "get-url", "origin"], cwd=str(repo),
+        capture_output=True, text=True, timeout=15,
+    )
+    if actual.returncode != 0 or _normalize_remote(actual.stdout.strip()) != _normalize_remote(expected_remote):
+        return {"status": "push_failed", "branch": branch, "message": "The repository origin no longer matches the GitHub URL submitted for this scan."}
+    try:
+        pushed = subprocess.run(
+            ["git", "push", "-u", "origin", branch], cwd=str(repo),
+            capture_output=True, text=True, timeout=180, shell=False,
+            env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+        )
+        return ({"status": "pushed", "branch": branch, "remote": expected_remote}
+                if pushed.returncode == 0 else
+                {"status": "push_failed", "branch": branch,
+                 "message": (pushed.stderr.strip() or "git push failed")[-1200:]})
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        return {"status": "push_failed", "branch": branch, "message": str(exc)}
+
+
+def _normalize_remote(value: str) -> str:
+    from urllib.parse import urlsplit
+
+    parsed = urlsplit(value.strip())
+    path = parsed.path.rstrip("/").removesuffix(".git")
+    return f"{(parsed.hostname or '').lower()}{path.lower()}"
 
 
 def push_and_create_pr(patch_result, target_branch: str, repo_path=None) -> dict:

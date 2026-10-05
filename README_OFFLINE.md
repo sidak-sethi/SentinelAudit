@@ -1,17 +1,16 @@
-# SentinelAuditor — Guard + Offline Security Engineer
+# SentinelAudit — Online, Guard, Offline, and dashboard
 
-This repository contains **only** the Guard and Offline halves of
-SentinelAuditor. There is no Online threat-intelligence system here, no
-Online Gemma, and no code that discovers, scrapes, or synthesizes
-real-world threats — that is a separate teammate's system, integrated
-later purely through the five functions in [`api.py`](api.py). Everything
-in `fixtures/` is a local test fixture that stands in for the Online
-system during development; it is not a reimplementation of it.
+This repository includes the Online threat-intelligence/research pipeline,
+the deterministic Guard, the local Offline audit/patch engine, and the React
+dashboard. Online collects public advisories and research, adapts its research
+results to the shared Guard contract, and exports them into the Guard outbox.
+Guard validation remains the boundary before threat data reaches the local
+audit queue. See [`README_ONLINE.md`](README_ONLINE.md) for live pipeline setup.
 
 ## 1. Architecture
 
 ```
-ONLINE (not in this repo)
+ONLINE threat intelligence (`app/`)
    |
    | threat package (untrusted data)
    v
@@ -31,6 +30,9 @@ LOCAL TARGET REPO (offline_workspace/target_repo)
 TEST -> PATCH -> TEST -> RE-AUDIT -> COMMIT or ROLLBACK
 ```
 
+- **Online** (`app/`) collects and enriches public security reports, then
+  triages and researches relevant threats. Its exporter adapts its internal
+  result into the exact Guard schema.
 - **Guard** (`guard/`) is a pure Python validation/allowlisting pipeline.
   It never calls an AI model — the security boundary must not depend on a
   model's judgment.
@@ -39,7 +41,7 @@ TEST -> PATCH -> TEST -> RE-AUDIT -> COMMIT or ROLLBACK
   vulnerability with a failing test, generate a structured patch, and
   validate it before committing.
 - **communication/** defines the shared schema and every configurable
-  filesystem path both halves use.
+  filesystem path used by the pipeline.
 
 ## 2. Guard
 
@@ -113,8 +115,8 @@ Environment variables (see `.env.example`):
 |---|---|---|
 | `OLLAMA_HOST` | `http://localhost:11434` | Ollama endpoint (must be loopback by default) |
 | `GEMMA_MODEL` | `gemma4:e2b` | Exact model tag to use |
-| `SENTINEL_MAX_SCAN_FINDINGS` | `5` | Maximum candidate findings to audit per scan (1–8; lower is faster) |
-| `MAX_PATCH_ATTEMPTS` | `3` | Cap on patch attempts before `UNRESOLVED` |
+| `SENTINEL_MAX_SCAN_FINDINGS` | `5` | Maximum candidates returned per scan (1–8) |
+| `MAX_PATCH_ATTEMPTS` | `1` | Patch attempts per click before `UNRESOLVED`; retry explicitly from the dashboard |
 | `SENTINEL_WORKSPACE` | `./offline_workspace` | Root for all runtime data |
 | `SENTINEL_REPOSITORIES_DIR` | `./offline_workspace/repositories` | Managed shallow clones submitted through the dashboard |
 | `SENTINEL_PATCH_HISTORY_FILE` | `./offline_workspace/patch_history.jsonl` | Append-only record of patch attempts across scans |
@@ -126,10 +128,21 @@ tag isn't pulled, every AI operation fails with a clear error instead of
 silently using a different model. Every model call logs both
 `MODEL: GEMMA 4` and `MODEL_TAG: <configured tag>`.
 
-Each candidate finding takes a separate audit, so scans with fewer candidates
-finish sooner. The default cap is five; set `SENTINEL_MAX_SCAN_FINDINGS=8`
-for broader coverage or a lower value for quicker scans. Repository sampling
-also skips common dependency and build directories while walking the tree.
+The dashboard runs one candidate scan and defers the slower proof audit until
+you select **Recheck & patch** for a finding. CLI scans still audit candidates
+immediately. Dashboard patching makes one patch attempt by default; use the
+retry action when another attempt is warranted. Set `MAX_PATCH_ATTEMPTS` to a
+higher value if you prefer automatic retries. The candidate cap defaults to
+five; set `SENTINEL_MAX_SCAN_FINDINGS=8` for broader coverage or a lower value
+for quicker scans. Repository sampling skips common dependency and build
+directories while walking the tree.
+
+The Overview also offers one user-triggered Online intelligence cycle. Set
+`LLM_API_KEY` in the local `.env` to enable it; source collection and LLM
+analysis require Internet access. Guard-approved packages appear in the local
+audit queue, where you can select a scanned repository and explicitly approve
+an audit-and-patch action. See [`README_ONLINE.md`](README_ONLINE.md) for the
+full Online flow and settings.
 
 ## 6. Running it
 
@@ -199,9 +212,9 @@ print(api.get_offline_events())
 The guaranteed demo does not depend on a live advisory matching the demo
 repository. `fixtures/sqli_demo_package.py` builds a hand-authored,
 correctly-signed threat package describing the exact SQLi class present
-in the fixture repo — **LOCAL DEMO MODE**. Once the Online teammate's real
-pipeline is integrated, a real advisory (**LIVE INTERNET MODE**) goes
-through the identical code path. If a real advisory doesn't actually
+in the fixture repo — **LOCAL DEMO MODE**. The integrated Online pipeline
+can send a real advisory (**LIVE INTERNET MODE**) through the same Guard and
+Offline path. If a real advisory doesn't actually
 apply to whatever repository is configured, the correct, required outcome
 is `NOT_APPLICABLE` (`fixtures/not_applicable_package.py` exercises this
 honestly) — the agent never invents a match to make a demo look
@@ -358,7 +371,7 @@ python api_server.py          # listens on http://127.0.0.1:5001
 | Method & path | What it does |
 |---|---|
 | `GET /health` | Guard status, Ollama reachability, whether the configured `GEMMA_MODEL` tag is actually pulled. |
-| `POST /scan` | Body `{"repository_url": "https://github.com/owner/repo"}` or `{"repo_path": "..."}`. A public GitHub URL is shallow-cloned once under `offline_workspace/repositories/`; existing clones are reused and never silently reset. Returns **every** finding, not only confirmed ones. A local non-git repo returns `409` with `status: "needs_git_init"` until the caller sends `confirm_git_init: true`; a dirty worktree also returns `409`. |
+| `POST /scan` | Body `{"repository_url": "https://github.com/owner/repo"}` or `{"repo_path": "..."}`. A public GitHub URL is shallow-cloned once under `offline_workspace/repositories/`; existing clones are reused and never silently reset. Runs one candidate scan and returns **every** lead as unconfirmed until its proof audit is requested with **Recheck & patch**. A local non-git repo returns `409` with `status: "needs_git_init"` until the caller sends `confirm_git_init: true`; a dirty worktree also returns `409`. |
 | `GET /findings` | All persisted findings from the latest report for each repository, newest first. This is the dashboard's main data feed. |
 | `GET /patch-history` | Every patch attempt, including previous attempts retained after a later scan replaces a repository's latest findings report. |
 | `POST /fixes/<threat_id>` | Body `{"repository": "..."}` identifies the repository when threat IDs overlap. For confirmed findings, runs the patch/test/validate/commit loop. For `uncertain`, `not_applicable`, or `ai_error` findings from a prior `/scan` in this server run, it re-runs the audit first and patches only if the generated security test confirms the vulnerability. Guard-rejected findings remain blocked. The scan context cache is in-memory, so rescan after a backend restart. Omitting `pr_base` keeps the fix local; the dashboard does not push or create PRs. |
@@ -432,7 +445,7 @@ everywhere else in this codebase. This same report shape is what
 `cli.py` now also saves to disk for every finding (confirmed or not), so
 the CLI and the API always agree.
 
-## 13. Integration for the Online teammate
+## 13. Python integration API
 
 The entire contract is five functions in [`api.py`](api.py):
 
@@ -444,8 +457,27 @@ get_latest_audit() -> dict | None
 start_offline_audit(package_path=None) -> dict
 ```
 
-The Online system only needs to produce a valid threat package (matching
-the schema above) and call `submit_threat_package`, either by writing the
-file into the directory `communication.paths.ONLINE_OUTBOX` points at and
-calling `submit_threat_package` on it, or by handing `submit_threat_package`
-a path directly. It needs no knowledge of Guard or Offline internals.
+External package producers can use this stable API without depending on
+Guard or Offline internals. The integrated Online pipeline uses the shared
+outbox directly; its exporter first adapts and signs each package to match
+the schema above, then the dashboard's one-cycle endpoint runs the normal
+Guard watcher.
+
+## Dashboard patch and push behavior
+
+For findings from a repository submitted by GitHub URL in the dashboard,
+the **Apply & push** action rechecks any unconfirmed result, then uses a
+locally prepared rule for currently supported hardcoded secret assignments
+and interpolated SQLite f-string queries. These rules are deterministic and
+limited to the identified affected files; unsupported patterns are reported
+as unresolved without a commit or push. The generated security regression
+test and the repository's configured tests must pass before the fix branch
+is committed and pushed to `origin`. The backend verifies that `origin`
+still matches the URL submitted for the scan, and only pushes the
+`ai-security-fix/<threat_id>` branch. It does not force-push, modify the
+default branch, or open a pull request. A failed push can be retried from
+the dashboard without applying the source change again.
+
+The backend host needs GitHub write access to the submitted repository for
+the push to succeed. A locally selected `repo_path` scan has no submitted
+GitHub URL and therefore cannot use this dashboard push action.

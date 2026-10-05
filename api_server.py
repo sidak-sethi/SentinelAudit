@@ -16,12 +16,14 @@ Run with:
     python api_server.py
 """
 import hashlib
+import asyncio
 import json
 import os
 import re
 import subprocess
 import tempfile
 import threading
+from datetime import datetime, timezone
 from urllib.parse import urlsplit
 
 from flask import Flask, jsonify, request
@@ -40,6 +42,7 @@ app = Flask(__name__)
 # demo/dashboard use case and is documented in README_OFFLINE.md.
 _findings_cache: dict = {}
 _lock = threading.Lock()
+_online_lock = threading.Lock()
 _PATCHABLE_STATUSES = {"confirmed", "not_applicable", "uncertain", "ai_error"}
 
 
@@ -97,6 +100,17 @@ def _github_repository_path(repository_url: str):
     return destination, None, None, True
 
 
+def _canonical_github_remote(repository_url: str | None) -> str | None:
+    if not repository_url:
+        return None
+    parsed = urlsplit(repository_url.strip())
+    parts = [part for part in parsed.path.strip("/").split("/") if part]
+    if parsed.scheme != "https" or parsed.hostname != "github.com" or len(parts) != 2:
+        return None
+    repo = parts[1][:-4] if parts[1].endswith(".git") else parts[1]
+    return f"https://github.com/{parts[0]}/{repo}.git"
+
+
 @app.route("/health", methods=["GET"])
 def health():
     ollama_reachable, model_pulled = gemma_client.check_runtime_status()
@@ -106,6 +120,142 @@ def health():
         "ollama_reachable": ollama_reachable,
         "model_pulled": model_pulled,
     })
+
+
+@app.route("/online/status", methods=["GET"])
+def online_status():
+    """Expose Online pipeline readiness and Guard-approved queue size."""
+    from app.config import get_settings
+
+    settings = get_settings()
+    queued = sorted(paths.OFFLINE_INBOX.glob("*.json"))
+    api_key_ready = bool(settings.llm_api_key and (settings.llm_triage_api_key or settings.llm_api_key))
+    return jsonify({
+        "configured": api_key_ready,
+        "provider": settings.llm_provider,
+        "model": settings.llm_model,
+        "queued_count": len(queued),
+    })
+
+
+@app.route("/online/queue", methods=["GET"])
+def online_queue():
+    """Return Guard-approved Online packages awaiting local audit."""
+    paths.ensure_directories()
+    packages = []
+    for package_path in sorted(paths.OFFLINE_INBOX.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+        try:
+            package = json.loads(package_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        packages.append({
+            "threat_id": package.get("threat_id"),
+            "title": package.get("title"),
+            "cve": package.get("cve") or None,
+            "severity": package.get("severity"),
+            "source": package.get("source") or {},
+            "affected_component": package.get("affected_component"),
+            "affected_versions": package.get("affected_versions") or [],
+            "fixed_versions": package.get("fixed_versions") or [],
+            "description": package.get("description"),
+            "remediation": package.get("remediation"),
+            "queued_at": datetime.fromtimestamp(package_path.stat().st_mtime, timezone.utc).isoformat(),
+            "audits": _audit_records(package.get("threat_id")),
+        })
+    return jsonify({"queued_count": len(packages), "packages": packages})
+
+
+def _audit_records(threat_id: str | None) -> list[dict]:
+    if not threat_id:
+        return []
+    records = []
+    for report_path in paths.REPORTS_DIR.glob("*.json"):
+        try:
+            run = json.loads(report_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        for finding in run.get("findings", []):
+            if finding.get("threat_id") == threat_id:
+                records.append({
+                    "repository": run.get("repository") or finding.get("repository"),
+                    "status": finding.get("status"),
+                    "patch_status": finding.get("patch_status"),
+                    "timestamp": finding.get("timestamp"),
+                })
+    return records
+
+
+@app.route("/online/cycle", methods=["POST"])
+def online_cycle():
+    """Run one user-triggered Online collection/research pass.
+
+    Exported files go through the normal Guard watcher and stay queued for
+    the separate local audit/patch flow. This route never starts that flow.
+    """
+    from app.config import get_settings
+    from app.main import run_cycle
+    from guard.guard import watch_once
+
+    settings = get_settings()
+    if not settings.llm_api_key:
+        return jsonify({"error": "Configure LLM_API_KEY before running the Online pipeline."}), 503
+    if not _online_lock.acquire(blocking=False):
+        return jsonify({"error": "An Online intelligence cycle is already running.", "status": "busy"}), 409
+
+    try:
+        cycle = asyncio.run(run_cycle())
+        guard_results = watch_once()
+        return jsonify({
+            "cycle": cycle,
+            "guard": [{"status": result.status, "threat_id": result.threat_id, "reason": result.reason} for result in guard_results],
+            "queued_count": len(list(paths.OFFLINE_INBOX.glob("*.json"))),
+            "message": "Guard-approved threat packages are queued for local audit. No repository audit or patch was started.",
+        })
+    except Exception as exc:
+        return jsonify({"error": f"Online cycle failed: {exc}"}), 502
+    finally:
+        _online_lock.release()
+
+
+@app.route("/online/audit/<threat_id>", methods=["POST"])
+def audit_online_package(threat_id):
+    """Explicitly audit one queued advisory against a selected repository.
+
+    The normal Offline workflow may apply a local, tested fix after the audit
+    confirms the finding. This route never pushes changes to a remote.
+    """
+    from offline import agent
+    from guard.validator import validate_package
+
+    body = request.get_json(silent=True) or {}
+    repository_path = body.get("repository") if isinstance(body, dict) else None
+    if not isinstance(repository_path, str) or not repository_path.strip():
+        return jsonify({"error": "Select a repository to audit this package against."}), 400
+    if not re.fullmatch(r"[A-Za-z0-9_:.\-]{1,128}", threat_id):
+        return jsonify({"error": "Invalid threat id."}), 400
+
+    package_path = paths.OFFLINE_INBOX / f"{threat_id}.json"
+    if not package_path.is_file():
+        return jsonify({"error": "No Guard-approved queued package exists for this threat."}), 404
+    validation = validate_package(package_path.read_bytes())
+    if not validation.ok or (validation.parsed or {}).get("threat_id") != threat_id:
+        return jsonify({"error": "The queued package failed its integrity or schema recheck."}), 409
+
+    with _lock:
+        selection = interactive.select_repo(repository_path)
+        if selection.status != "ready":
+            return jsonify({
+                "error": f"The selected repository is not ready for audit ({selection.status}).",
+                "status": selection.status,
+            }), 409
+        existing = next((record for record in _audit_records(threat_id) if record["repository"] == str(selection.path)), None)
+        if existing and (existing.get("patch_status") or existing.get("status") == "confirmed"):
+            return jsonify({"error": "This threat package already has a saved audit for the selected repository.", "audit": existing}), 409
+        try:
+            result = agent.start_offline_audit(package_path)
+        except Exception as exc:
+            return jsonify({"error": f"Offline audit failed: {exc}"}), 502
+    return jsonify({"audit": result, "repository": str(selection.path)})
 
 
 @app.route("/scan", methods=["POST"])
@@ -164,7 +314,10 @@ def scan():
             del _findings_cache[cache_key]
 
         try:
-            findings = interactive.find_vulnerabilities()
+            # Keep the dashboard's initial scan to one Gemma scan call plus
+            # deterministic Guard checks. The proof audit is deferred until
+            # the user requests Recheck & patch for a specific finding.
+            findings = interactive.find_vulnerabilities(verify_findings=False)
         except gemma_client.GemmaResponseError as exc:
             return jsonify({"status": "scan_failed", "error": str(exc)}), 502
         except gemma_client.GemmaUnavailableError as exc:
@@ -182,6 +335,7 @@ def scan():
                     "audit": finding.audit,
                     "repository": str(selection.path),
                     "status": finding.status,
+                    "remote_url": _canonical_github_remote(repository_url),
                 }
             results.append(report)
 
@@ -195,18 +349,13 @@ def fix(threat_id):
     same report shape as /scan's findings, now with code.after and diff
     populated if (and only if) the fix was actually accepted.
 
-    Body (optional): {"pr_base": "main"} -- if given AND the fix is
-    accepted, pushes the fix branch to 'origin' and opens a GitHub PR
-    against that branch via the gh CLI (see
-    offline.interactive.push_and_create_pr). There is no separate
-    confirmation step here the way cli.py has one -- calling this
-    endpoint with pr_base set IS the explicit request to push and open
-    a PR; omit pr_base to keep the fix local only, which is the default.
+    A matching prepared local fix is tested and committed, then its fix
+    branch is pushed to the exact GitHub URL used in the scan. No default
+    branch is modified and no pull request is opened.
     """
     body = request.get_json(silent=True) or {}
     if not isinstance(body, dict):
         return jsonify({"error": "Request body must be a JSON object."}), 400
-    pr_base = body.get("pr_base")
     requested_repository = body.get("repository")
 
     with _lock:
@@ -225,6 +374,11 @@ def fix(threat_id):
                 "error": f"no recheckable finding cached for '{threat_id}' -- run POST /scan first "
                          "(the cache is per server run, not persisted across restarts)",
             }), 404
+        if not cached.get("remote_url"):
+            return jsonify({
+                "error": "Patch and push requires scanning a GitHub repository URL in the dashboard first.",
+                "status": "repository_url_required",
+            }), 409
         audit_result = cached["audit"]
         selection = interactive.select_repo(cached["repository"])
         if selection.status != "ready":
@@ -232,6 +386,22 @@ def fix(threat_id):
                 "error": f"The cached repository is not ready for patching ({selection.status}). Commit or stash its local changes and rescan.",
                 "status": selection.status,
             }), 409
+        previous_patch = cached.get("patch_result")
+        if previous_patch is not None and previous_patch.status == "fixed" and cached.get("push_result", {}).get("status") != "pushed":
+            push_result = interactive.push_fix_branch(
+                previous_patch.branch, cached["remote_url"], cached["repository"],
+            )
+            cached["push_result"] = push_result
+            report = reports.build_finding_report(
+                package=audit_result.package or {}, status="confirmed",
+                reason=previous_patch.reasoning or audit_result.reasoning,
+                audit=audit_result, patch_result=previous_patch,
+            )
+            report["push_result"] = push_result
+            report["patch_available"] = push_result["status"] != "pushed"
+            reports.write_run_report([report], full_rescan=False)
+            reports.append_patch_history(report)
+            return jsonify(report)
         if cached["status"] != "confirmed":
             try:
                 audit_result = interactive.recheck_finding(audit_result)
@@ -249,14 +419,19 @@ def fix(threat_id):
                 report["patch_available"] = refreshed_status in _PATCHABLE_STATUSES
                 reports.write_run_report([report], full_rescan=False)
                 return jsonify(report)
-        patch_result = interactive.apply_fix(audit_result)
+        try:
+            patch_result, push_result = interactive.apply_prepared_fix(audit_result, cached["remote_url"])
+        except Exception as exc:
+            return jsonify({"error": str(exc), "status": "patch_preflight_failed"}), 409
         report = reports.build_finding_report(
             package=audit_result.package or {}, status="confirmed",
-            reason=audit_result.reasoning, audit=audit_result, patch_result=patch_result,
+            reason=patch_result.reasoning or audit_result.reasoning,
+            audit=audit_result, patch_result=patch_result,
         )
-        if patch_result.status == "fixed" and pr_base:
-            report["pull_request"] = interactive.push_and_create_pr(patch_result, pr_base)
+        report["push_result"] = push_result
         report["patch_available"] = patch_result.status != "fixed"
+        cached["patch_result"] = patch_result
+        cached["push_result"] = push_result
     return jsonify(report)
 
 
