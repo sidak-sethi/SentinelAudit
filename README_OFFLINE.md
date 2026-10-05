@@ -317,7 +317,7 @@ python api_server.py          # listens on http://127.0.0.1:5001
 | Method & path | What it does |
 |---|---|
 | `GET /health` | Guard status, Ollama reachability, whether the configured `GEMMA_MODEL` tag is actually pulled. |
-| `POST /scan` | Body `{"repo_path": "...", "confirm_git_init": false}`. Scans the repo and returns **every** finding (see below), not only confirmed ones. Returns `409` with `status: "needs_git_init"` or `"dirty_worktree"` instead of silently acting — re-POST with `confirm_git_init: true` to proceed past the former. |
+| `POST /scan` | Body `{"repository_url": "https://github.com/owner/repo"}` shallow-clones/reuses a public GitHub checkout under `offline_workspace/repositories/`, or `{"repo_path": "...", "confirm_git_init": false}` for a local checkout. Scans the repo and returns **every** finding (see below), not only confirmed ones. Returns `409` with `status: "needs_git_init"` or `"dirty_worktree"` for local path setup issues. |
 | `POST /fixes/<threat_id>` | Applies the patch/test/validate/commit loop for a finding that came back `confirmed` from a prior `/scan` call *in this server run* (the cache is in-memory, not persisted across restarts). |
 | `GET /audits` | Lists every codebase ever scanned (repository, last_run, finding/confirmed/fixed counts), newest first — one entry per codebase, not per finding. |
 | `GET /audits/<threat_id>` | Searches across every codebase's report for one finding by id. |

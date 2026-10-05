@@ -10,6 +10,7 @@ auditor.run_audit() proof step, and the same patcher.run_patch_loop() as
 the threat-package flow, so nothing here weakens any safety property.
 """
 import json
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -64,10 +65,35 @@ def select_repo(path) -> RepoSelection:
     if not repository.verify_git_repository():
         _base_branch = None
         return RepoSelection(status="needs_git_init", path=resolved)
+    cleanup_generated_security_tests(resolved)
     if not repository.verify_clean_worktree():
         return RepoSelection(status="dirty_worktree", path=resolved)
     _base_branch = repository.get_current_branch()
     return RepoSelection(status="ready", path=resolved)
+
+
+def cleanup_generated_security_tests(repo_path) -> None:
+    """Remove stale, untracked audit tests marked by SentinelAudit only."""
+    import subprocess
+
+    repo = Path(repo_path).resolve()
+    result = subprocess.run(
+        ["git", "ls-files", "--others", "--exclude-standard", "-z"],
+        cwd=str(repo), capture_output=True, text=True, timeout=15,
+    )
+    if result.returncode != 0:
+        return
+    marker = "SentinelAudit generated security regression test"
+    for relative in result.stdout.split("\0"):
+        if not relative.replace("\\", "/").startswith("tests/security/"):
+            continue
+        try:
+            candidate = (repo / relative).resolve(strict=True)
+            candidate.relative_to(repo)
+            if candidate.is_file() and marker in candidate.read_text(encoding="utf-8", errors="replace")[:512]:
+                candidate.unlink()
+        except (OSError, ValueError):
+            continue
 
 
 def init_git_repo() -> None:
@@ -102,12 +128,13 @@ def init_git_repo() -> None:
     _base_branch = repository.get_current_branch()
 
 
-def find_vulnerabilities(repo_path=None) -> list:
+def find_vulnerabilities(repo_path=None, verify_findings: bool = True) -> list:
     """Scan the (already-selected, or newly selected if repo_path is
     given) repository, turn every raw Gemma finding into a signed
     synthetic threat package, push it through the Guard exactly like an
-    Online-sourced package, and -- for every one the Guard approves --
-    run the real auditor.run_audit() proof step.
+    Online-sourced package. When `verify_findings` is true, every Guard
+    approved lead is proved with auditor.run_audit(); dashboard scans can
+    defer that slower step until a remediation request.
 
     Returns a ScanFinding for EVERY lead Gemma proposed, whatever happened
     to it -- nothing is dropped. Only entries with status == "confirmed"
@@ -147,21 +174,25 @@ def find_vulnerabilities(repo_path=None) -> list:
             ))
             continue  # even a self-generated finding must pass the Guard
 
-        package_path = paths.OFFLINE_INBOX / f"{package['threat_id']}.json"
-        # The scan already named the affected file(s) -- read them
-        # directly rather than hoping a freshly-guessed search pattern
-        # happens to match the same content again.
-        audit_result = auditor.run_audit(package_path, known_affected_files=finding.get("affected_files"))
-        status = "confirmed" if audit_result.status == "vulnerable" else audit_result.status
+        if verify_findings:
+            package_path = paths.OFFLINE_INBOX / f"{package['threat_id']}.json"
+            audit_result = auditor.run_audit(package_path, known_affected_files=finding.get("affected_files"))
+            status = "confirmed" if audit_result.status == "vulnerable" else audit_result.status
 
-        if status == "confirmed":
-            # Commit just this finding's generated test, by exact path --
-            # not `git add -A`, which would also sweep up any other
-            # confirmed finding's still-pending test from this same scan.
-            # This is what keeps the worktree clean between findings
-            # (fixing the "dirty_worktree on next scan" issue) and keeps
-            # each fix's eventual diff limited to its own patch.
-            repository.commit_path(audit_result.test_path, f"Add security regression test for {audit_result.threat_id}")
+            if status == "confirmed":
+                repository.commit_path(audit_result.test_path, f"Add security regression test for {audit_result.threat_id}")
+        else:
+            status = "uncertain"
+            audit_result = auditor.AuditResult(
+                status=status,
+                threat_id=package["threat_id"],
+                confidence=None,
+                reasoning="Fast scan candidate. Proof audit is deferred until remediation is requested.",
+                package=package,
+                affected_files=list(finding.get("affected_files") or []),
+                affected_lines=list(finding.get("affected_lines") or []),
+                vulnerability_hypothesis=package.get("description", ""),
+            )
 
         scan_finding = ScanFinding(
             raw=finding, package=package, status=status,
@@ -177,6 +208,21 @@ def find_vulnerabilities(repo_path=None) -> list:
     reports.write_run_report(finding_reports, full_rescan=True)
 
     return results
+
+
+def recheck_finding(audit_result):
+    """Run the proof audit for a candidate returned by a fast dashboard scan."""
+    package = audit_result.package or {}
+    if not package.get("threat_id"):
+        raise ValueError("The cached finding is missing its threat package.")
+    paths.ensure_directories()
+    with tempfile.TemporaryDirectory(prefix="sentinel-recheck-", dir=paths.OFFLINE_INBOX) as temp_dir:
+        package_path = Path(temp_dir) / "finding.json"
+        package_path.write_text(json.dumps(package), encoding="utf-8")
+        return auditor.run_audit(
+            package_path,
+            known_affected_files=(audit_result.affected_files or package.get("affected_files")),
+        )
 
 
 def apply_fix(audit_result):
