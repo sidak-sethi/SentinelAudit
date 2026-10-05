@@ -16,8 +16,11 @@ feeds every candidate through auditor.run_audit(), which only confirms a
 finding after it genuinely reproduces it with a real generated test.
 """
 import json
+import os
+from pathlib import Path
 from datetime import datetime, timezone
 
+from communication import paths
 from guard.validator import recompute_integrity_sha256
 from offline import gemma_client, tools
 from offline.auditor import SYSTEM_PROMPT, _untrusted_block
@@ -28,7 +31,8 @@ from offline.auditor import SYSTEM_PROMPT, _untrusted_block
 SKIP_DIR_NAMES = {
     ".git", "node_modules", "venv", ".venv", "env", "__pycache__",
     "dist", "build", ".pytest_cache", ".mypy_cache", ".idea", ".vscode",
-    "vendor", "target", "site-packages",
+    "vendor", "target", "site-packages", "coverage", "htmlcov", ".tox",
+    ".next", ".nuxt", ".cache", ".turbo", "bower_components", "Pods",
 }
 SOURCE_EXTENSIONS = {
     ".py", ".js", ".ts", ".jsx", ".tsx", ".java", ".go", ".rb", ".php",
@@ -47,7 +51,12 @@ SOURCE_EXTENSIONS = {
 MAX_FILES = 25
 MAX_BYTES_PER_FILE = 2500
 MAX_TOTAL_PROMPT_CHARS = 20_000
-MAX_FINDINGS = 8
+try:
+    # Every candidate is audited serially, so a lower default shortens the
+    # slowest part of a scan while still leaving a knob for broader scans.
+    MAX_FINDINGS = max(1, min(8, int(os.environ.get("SENTINEL_MAX_SCAN_FINDINGS", "5"))))
+except ValueError:
+    MAX_FINDINGS = 5
 
 
 # Path keywords that correlate with where real vulnerabilities tend to
@@ -69,11 +78,26 @@ def _priority_score(path: str) -> int:
     return sum(1 for keyword in PRIORITY_KEYWORDS if keyword in lower)
 
 
-def _relevant_files() -> list:
+def _repository_files() -> list:
+    """List files once, pruning generated/vendor trees during traversal.
+
+    tools.list_files() walks every descendant before the scanner can filter
+    node_modules, virtualenvs, build output, and other ignored directories.
+    Pruning in os.walk avoids spending time statting those trees at all.
+    """
+    root = paths.TARGET_REPO.resolve()
+    results = []
+    for current, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(name for name in dirnames if name not in SKIP_DIR_NAMES)
+        for filename in filenames:
+            relative = (Path(current) / filename).relative_to(root)
+            results.append(str(relative).replace("\\", "/"))
+    return sorted(results)
+
+
+def _relevant_files(file_paths: list | None = None) -> list:
     candidates = []
-    for path in tools.list_files("."):
-        if any(part in SKIP_DIR_NAMES for part in path.split("/")):
-            continue
+    for path in file_paths if file_paths is not None else _repository_files():
         basename = path.rsplit("/", 1)[-1]
         if "." not in basename:
             continue
@@ -90,24 +114,22 @@ def _relevant_files() -> list:
 MAX_FILE_LIST_ENTRIES = 200
 
 
-def _filtered_file_list() -> list:
+def _filtered_file_list(file_paths: list | None = None) -> list:
     """The full file list, unlike _relevant_files(), is used only as
     orientation context for Gemma -- but for a real repo it can run into
     the thousands (node_modules, vendor dirs, build output, ...), which
     alone is enough to blow the prompt budget and truncate the response.
     Apply the same skip-dir filtering and a hard cap."""
-    filtered = [
-        path for path in tools.list_files(".")
-        if not any(part in SKIP_DIR_NAMES for part in path.split("/"))
-    ]
-    return filtered[:MAX_FILE_LIST_ENTRIES]
+    file_paths = file_paths if file_paths is not None else _repository_files()
+    return file_paths[:MAX_FILE_LIST_ENTRIES]
 
 
 def _sample_repository() -> dict:
-    file_list = _filtered_file_list()
+    file_paths = _repository_files()
+    file_list = _filtered_file_list(file_paths)
     sampled = {}
     total_chars = 0
-    for path in _relevant_files():
+    for path in _relevant_files(file_paths):
         try:
             content = tools.read_file(path)
         except (FileNotFoundError, UnicodeDecodeError):

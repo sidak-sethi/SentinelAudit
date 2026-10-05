@@ -9,6 +9,7 @@ Adding a new language means adding one more LanguageProfile here, not
 touching the audit/patch control flow.
 """
 import json
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -211,6 +212,12 @@ _OTHER_LANGUAGE_MARKERS = {
     "composer.json": "PHP",
     "Cargo.toml": "Rust",
 }
+_LANGUAGE_SCAN_SKIP_DIRS = {
+    ".git", "node_modules", "venv", ".venv", "env", "__pycache__",
+    "dist", "build", ".pytest_cache", ".mypy_cache", ".idea", ".vscode",
+    "vendor", "target", "site-packages", "coverage", "htmlcov", ".tox",
+    ".next", ".nuxt", ".cache", ".turbo", "bower_components", "Pods",
+}
 
 
 def detect_language(repo_path) -> LanguageProfile | None:
@@ -226,8 +233,18 @@ def detect_language(repo_path) -> LanguageProfile | None:
     if any((repo_path / marker).exists() for marker in _JAVASCRIPT_MARKERS):
         return JAVASCRIPT
 
-    python_files = len(list(repo_path.rglob("*.py")))
-    js_files = len(list(repo_path.rglob("*.js"))) + len(list(repo_path.rglob("*.ts")))
+    python_files = 0
+    js_files = 0
+    # A marker-less repo still needs source counting, but don't recursively
+    # enumerate dependency/build trees or allocate a list for every match.
+    for _current, dirnames, filenames in os.walk(repo_path):
+        dirnames[:] = [name for name in dirnames if name not in _LANGUAGE_SCAN_SKIP_DIRS]
+        for filename in filenames:
+            suffix = Path(filename).suffix
+            if suffix == ".py":
+                python_files += 1
+            elif suffix in {".js", ".ts"}:
+                js_files += 1
     if python_files == 0 and js_files == 0:
         return None
     return PYTHON if python_files >= js_files else JAVASCRIPT

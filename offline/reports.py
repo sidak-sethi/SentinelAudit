@@ -11,10 +11,13 @@ time) upserts just its own entry into the same file instead, so repeated
 single-threat checks don't erase each other."""
 import hashlib
 import json
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
 from communication import paths
+
+_patch_history_lock = threading.Lock()
 
 
 def build_report(audit, patch_result=None) -> str:
@@ -197,6 +200,33 @@ def write_run_report(findings: list, repo_path=None, full_rescan: bool = True) -
     json_path.write_text(json.dumps(run, indent=2, default=str), encoding="utf-8")
     txt_path.write_text(_render_run_text(run), encoding="utf-8")
     return run
+
+
+def append_patch_history(finding: dict) -> None:
+    """Keep every patch attempt available after a later full scan replaces
+    the repository's latest-run report.
+    """
+    paths.ensure_directories()
+    with _patch_history_lock:
+        with paths.PATCH_HISTORY_FILE.open("a", encoding="utf-8") as history_file:
+            history_file.write(json.dumps(finding, default=str) + "\n")
+
+
+def read_patch_history() -> list:
+    """Load append-only patch records, skipping an incomplete/corrupt line."""
+    paths.ensure_directories()
+    if not paths.PATCH_HISTORY_FILE.exists():
+        return []
+    history = []
+    with paths.PATCH_HISTORY_FILE.open("r", encoding="utf-8") as history_file:
+        for line in history_file:
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(entry, dict):
+                history.append(entry)
+    return history
 
 
 def get_latest_audit(repo_path=None) -> dict | None:

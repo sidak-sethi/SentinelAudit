@@ -22,6 +22,8 @@ GUARD_REJECTED = _env_path("SENTINEL_GUARD_REJECTED", WORKSPACE_ROOT / "guard_re
 OFFLINE_INBOX = _env_path("SENTINEL_OFFLINE_INBOX", WORKSPACE_ROOT / "offline_inbox")
 TARGET_REPO = _env_path("SENTINEL_TARGET_REPO", WORKSPACE_ROOT / "target_repo")
 REPORTS_DIR = _env_path("SENTINEL_REPORTS_DIR", WORKSPACE_ROOT / "reports")
+REPOSITORIES_DIR = _env_path("SENTINEL_REPOSITORIES_DIR", WORKSPACE_ROOT / "repositories")
+PATCH_HISTORY_FILE = _env_path("SENTINEL_PATCH_HISTORY_FILE", WORKSPACE_ROOT / "patch_history.jsonl")
 
 GUARD_EVENT_LOG = _env_path("SENTINEL_GUARD_EVENT_LOG", WORKSPACE_ROOT / "guard_events.jsonl")
 OFFLINE_EVENT_LOG = _env_path("SENTINEL_OFFLINE_EVENT_LOG", WORKSPACE_ROOT / "offline_events.jsonl")
@@ -35,7 +37,7 @@ def ensure_directories() -> None:
     run. Never creates or touches TARGET_REPO itself -- that is scaffolded
     explicitly by fixtures/setup_target_repo.py (it needs its own git init,
     not just an empty folder)."""
-    for directory in (WORKSPACE_ROOT, ONLINE_OUTBOX, GUARD_REJECTED, OFFLINE_INBOX, REPORTS_DIR):
+    for directory in (WORKSPACE_ROOT, ONLINE_OUTBOX, GUARD_REJECTED, OFFLINE_INBOX, REPORTS_DIR, REPOSITORIES_DIR, PATCH_HISTORY_FILE.parent):
         directory.mkdir(parents=True, exist_ok=True)
 
 

@@ -81,11 +81,19 @@ could be used to send anything back toward Online.
 
 ## 4. Isolation model (read this before claiming anything about it)
 
-The Offline agent makes exactly one kind of network call: to
+The Offline AI agent makes exactly one kind of model network call: to
 `OLLAMA_HOST` (default `http://localhost:11434`), which is checked against
 a loopback allowlist by default (`offline/gemma_client.py`). No other
-network code exists anywhere in the Offline execution path — no
+network code exists in the AI analysis/patch execution path — no
 `requests`, `httpx`, raw `socket`, or `webbrowser` usage.
+
+The dashboard API has one separate, user-triggered network operation:
+`POST /scan` may shallow-clone a public `https://github.com/owner/repo`
+URL into `offline_workspace/repositories/` before handing the local
+checkout to the Offline agent. The URL is restricted to GitHub HTTPS,
+credentials and alternate hosts are rejected, existing clones are reused
+without pulling or resetting, and scanning never pushes to GitHub. To
+avoid repository downloads, send a local `repo_path` instead.
 
 **This prototype implements the application-level isolation boundary.**
 It is an *isolated offline security environment*, not a certified air
@@ -105,8 +113,11 @@ Environment variables (see `.env.example`):
 |---|---|---|
 | `OLLAMA_HOST` | `http://localhost:11434` | Ollama endpoint (must be loopback by default) |
 | `GEMMA_MODEL` | `gemma4:e2b` | Exact model tag to use |
+| `SENTINEL_MAX_SCAN_FINDINGS` | `5` | Maximum candidate findings to audit per scan (1–8; lower is faster) |
 | `MAX_PATCH_ATTEMPTS` | `3` | Cap on patch attempts before `UNRESOLVED` |
 | `SENTINEL_WORKSPACE` | `./offline_workspace` | Root for all runtime data |
+| `SENTINEL_REPOSITORIES_DIR` | `./offline_workspace/repositories` | Managed shallow clones submitted through the dashboard |
+| `SENTINEL_PATCH_HISTORY_FILE` | `./offline_workspace/patch_history.jsonl` | Append-only record of patch attempts across scans |
 
 `GEMMA_MODEL` is the **only** way to change models, and only to another
 tag you explicitly pull yourself (e.g. a larger Gemma 4 variant if your
@@ -114,6 +125,11 @@ hardware supports it). There is no automatic fallback: if the configured
 tag isn't pulled, every AI operation fails with a clear error instead of
 silently using a different model. Every model call logs both
 `MODEL: GEMMA 4` and `MODEL_TAG: <configured tag>`.
+
+Each candidate finding takes a separate audit, so scans with fewer candidates
+finish sooner. The default cap is five; set `SENTINEL_MAX_SCAN_FINDINGS=8`
+for broader coverage or a lower value for quicker scans. Repository sampling
+also skips common dependency and build directories while walking the tree.
 
 ## 6. Running it
 
@@ -136,6 +152,31 @@ python fixtures/sqli_demo_package.py
 python fixtures/malicious_package.py
 python fixtures/not_applicable_package.py
 ```
+
+### Start the dashboard and API
+
+Run the backend and frontend in separate terminals. The frontend Vite
+server proxies `/api/*` to the local Flask server on port 5001.
+
+```bash
+# Terminal 1, from the repository root
+python api_server.py
+
+# Terminal 2
+cd client
+npm install
+npm run dev
+```
+
+Start Ollama and pull the configured Gemma model before submitting a scan.
+The dashboard loads persisted reports and Guard/Offline event logs from the
+backend, shows backend and model availability, and refreshes report data
+every 15 seconds and after scans or patch attempts. JSON imports are retained
+in this browser and shown alongside backend findings. Confirmed findings can
+start patching directly; uncertain, not-applicable, and AI-error findings can
+be rechecked, and patching proceeds only if the fresh security audit confirms
+the vulnerability. Guard-rejected findings stay blocked. Export includes
+both backend and browser-imported findings.
 
 ```python
 import api
@@ -317,8 +358,10 @@ python api_server.py          # listens on http://127.0.0.1:5001
 | Method & path | What it does |
 |---|---|
 | `GET /health` | Guard status, Ollama reachability, whether the configured `GEMMA_MODEL` tag is actually pulled. |
-| `POST /scan` | Body `{"repo_path": "...", "confirm_git_init": false}`. Scans the repo and returns **every** finding (see below), not only confirmed ones. Returns `409` with `status: "needs_git_init"` or `"dirty_worktree"` instead of silently acting — re-POST with `confirm_git_init: true` to proceed past the former. |
-| `POST /fixes/<threat_id>` | Applies the patch/test/validate/commit loop for a finding that came back `confirmed` from a prior `/scan` call *in this server run* (the cache is in-memory, not persisted across restarts). |
+| `POST /scan` | Body `{"repository_url": "https://github.com/owner/repo"}` or `{"repo_path": "..."}`. A public GitHub URL is shallow-cloned once under `offline_workspace/repositories/`; existing clones are reused and never silently reset. Returns **every** finding, not only confirmed ones. A local non-git repo returns `409` with `status: "needs_git_init"` until the caller sends `confirm_git_init: true`; a dirty worktree also returns `409`. |
+| `GET /findings` | All persisted findings from the latest report for each repository, newest first. This is the dashboard's main data feed. |
+| `GET /patch-history` | Every patch attempt, including previous attempts retained after a later scan replaces a repository's latest findings report. |
+| `POST /fixes/<threat_id>` | Body `{"repository": "..."}` identifies the repository when threat IDs overlap. For confirmed findings, runs the patch/test/validate/commit loop. For `uncertain`, `not_applicable`, or `ai_error` findings from a prior `/scan` in this server run, it re-runs the audit first and patches only if the generated security test confirms the vulnerability. Guard-rejected findings remain blocked. The scan context cache is in-memory, so rescan after a backend restart. Omitting `pr_base` keeps the fix local; the dashboard does not push or create PRs. |
 | `GET /audits` | Lists every codebase ever scanned (repository, last_run, finding/confirmed/fixed counts), newest first — one entry per codebase, not per finding. |
 | `GET /audits/<threat_id>` | Searches across every codebase's report for one finding by id. |
 | `GET /events/guard`, `GET /events/offline` | The same event logs `api.get_guard_events()`/`get_offline_events()` expose. |
@@ -332,6 +375,9 @@ Every run **overwrites** that one file — a full scan (`cli.py scan` /
 `POST /scan`) replaces its findings list with the current run's results;
 applying a fix afterward updates just that finding's entry in place.
 Nothing here ever creates a new timestamped file per finding or per run.
+Each attempted fix is also appended to
+`offline_workspace/patch_history.jsonl` so the dashboard's patch history
+survives later full scans.
 
 ```python
 from offline import reports

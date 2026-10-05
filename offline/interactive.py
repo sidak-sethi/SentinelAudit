@@ -10,6 +10,7 @@ auditor.run_audit() proof step, and the same patcher.run_patch_loop() as
 the threat-package flow, so nothing here weakens any safety property.
 """
 import json
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -179,6 +180,24 @@ def find_vulnerabilities(repo_path=None) -> list:
     return results
 
 
+def recheck_finding(audit_result):
+    """Run the normal Guard-approved audit again for one previously
+    unconfirmed finding. A patch may follow only if the generated security
+    test now reproduces the vulnerability.
+    """
+    package = audit_result.package or {}
+    if not package:
+        raise ValueError("the finding has no saved threat package to recheck")
+    paths.ensure_directories()
+    with tempfile.TemporaryDirectory(prefix="sentinel-reaudit-", dir=paths.OFFLINE_INBOX) as directory:
+        package_path = Path(directory) / "finding.json"
+        package_path.write_text(json.dumps(package), encoding="utf-8")
+        return auditor.run_audit(
+            package_path,
+            known_affected_files=audit_result.affected_files or package.get("affected_files"),
+        )
+
+
 def apply_fix(audit_result):
     """Run the existing patch/test/validate/commit loop for one
     already-confirmed finding, and update its entry in the same
@@ -190,6 +209,7 @@ def apply_fix(audit_result):
         reason=audit_result.reasoning, audit=audit_result, patch_result=patch_result,
     )
     reports.write_run_report([enriched], full_rescan=False)
+    reports.append_patch_history(enriched)
     return patch_result
 
 

@@ -85,14 +85,26 @@ def check_model_available(model: str | None = None) -> bool:
         return False
 
 
+def check_runtime_status(model: str | None = None) -> tuple[bool, bool]:
+    """Check Ollama reachability and the configured model with one request."""
+    model = model or get_gemma_model()
+    try:
+        installed_models = list_models()
+    except GemmaUnavailableError:
+        return False, False
+    return True, model in installed_models
+
+
 def ensure_available() -> None:
     model = get_gemma_model()
-    if not check_ollama_available():
+    try:
+        installed_models = list_models()
+    except GemmaUnavailableError as exc:
         raise GemmaUnavailableError(
             f"ERROR:\nOllama is not reachable at {get_ollama_host()}.\n"
             "Please start Ollama before running the Offline Auditor."
-        )
-    if not check_model_available(model):
+        ) from exc
+    if model not in installed_models:
         raise GemmaUnavailableError(
             f"ERROR:\nGemma 4 model {model} is unavailable.\n"
             f"Please install it with Ollama before starting the Offline Auditor "

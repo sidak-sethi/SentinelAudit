@@ -1,16 +1,8 @@
-import { useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import type { ChangeEvent, FormEvent } from 'react'
+import { api, ApiError } from './api'
+import type { BackendEvent, BackendHealth, Finding } from './api'
 import './App.css'
-
-type Finding = {
-  threat_id: string; title: string; cve: string | null; attack_type: string; severity: string
-  source: { type: string; url: string; published: string; retrieved_at: string }
-  status: string; patch_status: string | null; repository: string; branch: string | null
-  affected_files: string[]; affected_lines: number[]; confidence: number
-  vulnerability_hypothesis: string; recommended_fix: string; security_test_path: string | null
-  code: Record<string, { before: string; after: string | null }>; diff: string | null
-  patch_attempts: number; final_audit: string | null; reason: string | null; timestamp: string
-}
 
 const sample: Finding = {
   threat_id: 'manual-scan-005-hardcoded-jwt-secret', title: 'Hardcoded JWT Secret', cve: null,
@@ -28,10 +20,39 @@ const sample: Finding = {
 const readSaved = (): Finding[] => {
   try { const value = localStorage.getItem('sentinelaudit-findings'); return value ? JSON.parse(value) as Finding[] : [sample] } catch { return [sample] }
 }
+const readImported = (): Finding[] => {
+  try { const value = localStorage.getItem('sentinelaudit-imported-findings'); return value ? JSON.parse(value) as Finding[] : [] } catch { return [] }
+}
+const combineWithImported = (backendFindings: Finding[]) => mergeFindings(readImported(), backendFindings)
 const pretty = (value: string) => value.replaceAll('_', ' ')
+const finalAuditLabel = (value: Finding['final_audit']) => {
+  if (typeof value === 'string') return pretty(value)
+  if (value && typeof value.status === 'string') return pretty(value.status)
+  return 'Pending'
+}
 const date = (value?: string | null) => value ? new Date(value).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' }) : '—'
+const sameFinding = (a: Finding, b: Finding) => a.threat_id === b.threat_id && a.repository === b.repository
+const mergePatchHistory = (backendHistory: Finding[], imported: Finding[]) => {
+  const entries = [...backendHistory, ...imported.filter(item => item.patch_status)]
+  const seen = new Set<string>()
+  return entries.filter(item => {
+    const key = `${item.repository}:${item.threat_id}:${item.timestamp}`
+    if (seen.has(key)) return false
+    seen.add(key)
+    return true
+  }).sort((a, b) => b.timestamp.localeCompare(a.timestamp))
+}
+const mergeFindings = (current: Finding[], incoming: Finding[]) => {
+  const merged = [...current]
+  incoming.forEach(item => {
+    const index = merged.findIndex(existing => sameFinding(existing, item))
+    if (index >= 0) merged[index] = item
+    else merged.unshift(item)
+  })
+  return merged
+}
 const icon = (name: string) => {
-  const paths: Record<string, string> = { grid: '<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>', shield: '<path d="M12 22s8-4 8-11V5l-8-3-8 3v6c0 7 8 11 8 11Z"/><path d="m9 12 2 2 4-4"/>', clock: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>', upload: '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m17 8-5-5-5 5M12 3v12"/>', search: '<circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/>', arrow: '<path d="M7 17 17 7M7 7h10v10"}', close: '<path d="m18 6-12 12M6 6l12 12"/>', file: '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6M8 13h8M8 17h8"/>', chevron: '<path d="m9 18 6-6-6-6"/>' }
+  const paths: Record<string, string> = { grid: '<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>', shield: '<path d="M12 22s8-4 8-11V5l-8-3-8 3v6c0 7 8 11 8 11Z"/><path d="m9 12 2 2 4-4"/>', clock: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>', upload: '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m17 8-5-5-5 5M12 3v12"/>', search: '<circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/>', arrow: '<path d="M7 17 17 7M7 7h10v10"/>', close: '<path d="m18 6-12 12M6 6l12 12"/>', file: '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6M8 13h8M8 17h8"/>', chevron: '<path d="m9 18 6-6-6-6"/>' }
   return <svg className="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" dangerouslySetInnerHTML={{ __html: paths[name] || paths.file }} />
 }
 
@@ -41,13 +62,51 @@ function App() {
   const [severity, setSeverity] = useState('all')
   const [status, setStatus] = useState('all')
   const [active, setActive] = useState<Finding | null>(null)
+  const [patchHistory, setPatchHistory] = useState<Finding[]>(() => readImported().filter(item => item.patch_status))
   const [section, setSection] = useState<'overview' | 'findings' | 'history'>('overview')
   const [notice, setNotice] = useState('')
   const [repoUrl, setRepoUrl] = useState('')
   const [repoBusy, setRepoBusy] = useState(false)
   const [repoError, setRepoError] = useState('')
+  const [fixBusy, setFixBusy] = useState(false)
+  const [fixError, setFixError] = useState('')
+  const [backendStatus, setBackendStatus] = useState<'checking' | 'online' | 'offline'>('checking')
+  const [backendHealth, setBackendHealth] = useState<BackendHealth | null>(null)
+  const [backendEvents, setBackendEvents] = useState<BackendEvent[]>([])
   const fileRef = useRef<HTMLInputElement>(null)
   const save = (items: Finding[]) => { setFindings(items); localStorage.setItem('sentinelaudit-findings', JSON.stringify(items)) }
+  const refreshBackendFindings = async () => {
+    const items = combineWithImported(await api.findings())
+    save(items)
+    return items
+  }
+  const refreshBackendEvents = async () => setBackendEvents(await api.events())
+  const refreshBackendPatchHistory = async () => setPatchHistory(mergePatchHistory(await api.patchHistory(), readImported()))
+  useEffect(() => {
+    let mounted = true
+    const checkBackend = async () => {
+      try {
+        const health = await api.health()
+        if (mounted) {
+          setBackendHealth(health)
+          setBackendStatus('online')
+        }
+        const [reportsResult, eventsResult, historyResult] = await Promise.allSettled([api.findings(), api.events(), api.patchHistory()])
+        if (mounted && reportsResult.status === 'fulfilled') {
+          const combined = combineWithImported(reportsResult.value)
+          save(combined)
+          setActive(previous => previous ? combined.find(item => sameFinding(item, previous)) || previous : null)
+        }
+        if (mounted && eventsResult.status === 'fulfilled') setBackendEvents(eventsResult.value)
+        if (mounted && historyResult.status === 'fulfilled') setPatchHistory(mergePatchHistory(historyResult.value, readImported()))
+      } catch {
+        if (mounted) { setBackendStatus('offline'); setBackendHealth(null) }
+      }
+    }
+    void checkBackend()
+    const interval = window.setInterval(() => { void checkBackend() }, 15000)
+    return () => { mounted = false; window.clearInterval(interval) }
+  }, [])
   const filtered = useMemo(() => findings.filter(f => (severity === 'all' || f.severity.toLowerCase() === severity) && (status === 'all' || f.status === status) && `${f.title} ${f.threat_id} ${f.attack_type} ${f.repository}`.toLowerCase().includes(query.toLowerCase())), [findings, query, severity, status])
   const patches = findings.filter(f => f.patch_status)
   const repositoriesCount = new Set(findings.map(f => f.repository).filter(Boolean)).size
@@ -74,9 +133,14 @@ function App() {
     try {
       const parsed: unknown = JSON.parse(await file.text()); const values = Array.isArray(parsed) ? parsed : [parsed]
       if (!values.length || !values.every(v => typeof v === 'object' && v !== null && 'threat_id' in v && 'title' in v)) throw new Error('Expected a finding object or array with threat_id and title fields.')
-      const incoming = values as Finding[]; const merged = [...findings]
-      incoming.forEach(item => { const index = merged.findIndex(existing => existing.threat_id === item.threat_id); if (index >= 0) merged[index] = item; else merged.unshift(item) })
-      save(merged); setNotice(`${incoming.length} finding${incoming.length === 1 ? '' : 's'} imported`); setTimeout(() => setNotice(''), 3000)
+      const previousImports = readImported()
+      const incoming = (values as Finding[]).map(item => ({ ...item, patch_available: false }))
+      const imported = mergeFindings(previousImports, incoming)
+      localStorage.setItem('sentinelaudit-imported-findings', JSON.stringify(imported))
+      setPatchHistory(current => mergePatchHistory(current, incoming))
+      const currentBackendFindings = findings.filter(item => !previousImports.some(importedItem => sameFinding(item, importedItem)))
+      save(mergeFindings(imported, currentBackendFindings))
+      setNotice(`${incoming.length} finding${incoming.length === 1 ? '' : 's'} imported`); setTimeout(() => setNotice(''), 3000)
     } catch (error) { setNotice(error instanceof Error ? error.message : 'Could not read JSON file'); setTimeout(() => setNotice(''), 4000) }
     event.target.value = ''
   }
@@ -85,23 +149,43 @@ function App() {
     event.preventDefault(); setRepoError('')
     let parsedUrl: URL
     try { parsedUrl = new URL(repoUrl.trim()) } catch { setRepoError('Enter a valid GitHub repository URL.'); return }
-    if (parsedUrl.hostname !== 'github.com' || parsedUrl.pathname.split('/').filter(Boolean).length < 2) { setRepoError('Use a GitHub URL in the format github.com/owner/repository.'); return }
+    const repoSegments = parsedUrl.pathname.split('/').filter(Boolean)
+    if (parsedUrl.protocol !== 'https:' || parsedUrl.hostname !== 'github.com' || repoSegments.length !== 2 || parsedUrl.search || parsedUrl.hash) { setRepoError('Use a public GitHub HTTPS URL in the format https://github.com/owner/repository.'); return }
     setRepoBusy(true)
     try {
-      const endpoint = import.meta.env.VITE_API_URL || 'http://localhost:8000/api/scan'
-      const response = await fetch(endpoint, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ repository_url: parsedUrl.href.replace(/\/$/, '') }) })
-      const body: unknown = await response.json().catch(() => null)
-      if (!response.ok) throw new Error(typeof body === 'object' && body !== null && 'detail' in body ? String(body.detail) : `Backend returned ${response.status}.`)
-      const payload = typeof body === 'object' && body !== null && 'findings' in body ? body.findings : body
-      const values = Array.isArray(payload) ? payload : [payload]
-      const valid = values.filter((v): v is Finding => typeof v === 'object' && v !== null && 'threat_id' in v && 'title' in v)
-      if (valid.length) {
-        const merged = [...findings]
-        valid.forEach(item => { const index = merged.findIndex(existing => existing.threat_id === item.threat_id); if (index >= 0) merged[index] = item; else merged.unshift(item) })
-        save(merged); setNotice(`${valid.length} finding${valid.length === 1 ? '' : 's'} received from the repository scan`); setTimeout(() => setNotice(''), 4000)
-      } else setNotice('Repository submitted to the backend. Findings will appear after a scan result is returned.')
-    } catch (error) { setRepoError(error instanceof Error ? `${error.message} Check that the backend is running and VITE_API_URL points to its scan endpoint.` : 'Could not reach the scan backend.') }
+      const result = await api.scan(parsedUrl.href.replace(/\/$/, ''))
+      setBackendStatus('online')
+      setRepoUrl('')
+      try { await refreshBackendFindings() } catch { save(mergeFindings(findings, result.findings)) }
+      void refreshBackendEvents().catch(() => undefined)
+      void refreshBackendPatchHistory().catch(() => undefined)
+      setNotice(`Scan complete: ${result.findings.length} finding${result.findings.length === 1 ? '' : 's'} returned. ${result.cloned ? 'A new shallow clone was created.' : 'The existing managed checkout was reused.'}`)
+      setTimeout(() => setNotice(''), 5000)
+    } catch (error) {
+      if (error instanceof ApiError && error.body.status === 'needs_git_init') setRepoError(`${error.message} Confirm Git initialization and try again.`)
+      else setRepoError(error instanceof Error ? error.message : 'Could not reach the scan backend.')
+    }
     finally { setRepoBusy(false) }
+  }
+  const submitFix = async (finding: Finding) => {
+    if (finding.status === 'guard_rejected' || finding.patch_status === 'fixed' || !finding.patch_available) return
+    const rechecking = finding.status !== 'confirmed'
+    const action = rechecking ? 'Recheck this finding and start patching only if the security audit confirms it' : 'Run the security patch workflow'
+    const approved = window.confirm(`${action} for “${finding.title}”? The backend will test and commit an accepted fix to a local branch. It will not push or open a pull request.`)
+    if (!approved) return
+    setActive(finding)
+    setFixBusy(true); setFixError('')
+    try {
+      const updated = await api.fix(finding)
+      setActive(updated)
+      save(findings.map(f => sameFinding(f, updated) ? updated : f))
+      try { await refreshBackendFindings() } catch { /* Keep the successful fix response visible. */ }
+      void refreshBackendEvents().catch(() => undefined)
+      void refreshBackendPatchHistory().catch(() => undefined)
+      setNotice(updated.status !== 'confirmed' ? `Recheck finished for ${updated.title}: ${pretty(updated.status)}. No patch was applied.` : updated.patch_status === 'fixed' ? `Patch verified for ${updated.title}.` : `Patch attempt finished for ${updated.title}: ${pretty(updated.patch_status || 'unresolved')}.`)
+      setTimeout(() => setNotice(''), 5000)
+    } catch (error) { setFixError(error instanceof Error ? error.message : 'The patch workflow failed.') }
+    finally { setFixBusy(false) }
   }
 
   return <div className="app-shell">
@@ -111,11 +195,11 @@ function App() {
       <nav className="nav-list" aria-label="Main navigation">
         {([['overview', 'grid', 'Overview'], ['findings', 'shield', 'Vulnerabilities'], ['history', 'clock', 'Patch history']] as const).map(([key, glyph, label]) => <button className={`nav-item ${section === key ? 'selected' : ''}`} key={key} onClick={() => setSection(key)}>{icon(glyph)}<span>{label}</span>{key === 'findings' && <b className="nav-count">{findings.length}</b>}</button>)}
       </nav>
-      <div className="sidebar-bottom"><div className="connection-dot" /><span>Local workspace</span><span className="connection-state">Connected</span><p>Findings stay in this browser. Import a scan to get started.</p></div>
+      <div className="sidebar-bottom"><div className={`connection-dot backend-${backendStatus}`} /><span>Backend API</span><span className={`connection-state backend-text-${backendStatus}`}>{backendStatus === 'checking' ? 'Checking' : backendStatus === 'online' ? 'Online' : 'Offline'}</span><p>{backendHealth ? `${backendHealth.gemma_model_tag} · ${backendHealth.model_pulled ? 'model ready' : backendHealth.ollama_reachable ? 'model not pulled' : 'Ollama unavailable'}` : backendStatus === 'offline' ? 'Start the API with python api_server.py' : 'Connecting to local API…'}</p></div>
     </aside>
 
     <main className="main-content">
-      <header className="topbar"><div className="breadcrumb">Security <span>/</span> <strong>{section === 'overview' ? 'Overview' : section === 'findings' ? 'Vulnerabilities' : 'Patch history'}</strong></div><div className="top-actions"><span className="updated"><span className="live-dot" /> Updated just now</span><button className="button button-outline" onClick={exportData}>Export data</button><button className="button button-primary" onClick={() => fileRef.current?.click()}>{icon('upload')} Import scan</button><input ref={fileRef} type="file" accept="application/json,.json" hidden onChange={importFile} /></div></header>
+      <header className="topbar"><div className="breadcrumb">Security <span>/</span> <strong>{section === 'overview' ? 'Overview' : section === 'findings' ? 'Vulnerabilities' : 'Patch history'}</strong></div><div className="top-actions"><span className={`updated backend-text-${backendStatus}`}><span className={`live-dot backend-${backendStatus}`} />{backendStatus === 'online' ? 'Backend connected' : backendStatus === 'offline' ? 'Backend offline' : 'Connecting…'}</span><button className="button button-outline" onClick={exportData}>Export data</button><button className="button button-primary" onClick={() => fileRef.current?.click()}>{icon('upload')} Import JSON</button><input ref={fileRef} type="file" accept="application/json,.json" hidden onChange={importFile} /></div></header>
 
       <div className="page-wrap">
         <section className="page-heading"><div><div className="eyebrow">SECURITY WORKSPACE <span>·</span> {new Date().toLocaleDateString(undefined, { month: 'long', year: 'numeric' }).toUpperCase()}</div><h1>{section === 'history' ? 'Patch history' : section === 'findings' ? 'Vulnerabilities' : 'Security overview'}</h1><p>{section === 'history' ? 'Review remediation attempts and audit outcomes across your repositories.' : section === 'findings' ? 'Search, filter, and inspect every vulnerability found in your repositories.' : 'Monitor findings, agent progress, and remediation health in one place.'}</p></div><button className="button button-primary heading-import" onClick={() => fileRef.current?.click()}>{icon('upload')} Import scan</button></section>
@@ -124,7 +208,7 @@ function App() {
         {section !== 'history' && <>
         {section === 'overview' && <>
           <section className="metrics" aria-label="Finding summary">
-            <article className="metric-card"><div className="metric-top"><span>Total findings</span><span className="metric-icon violet">{icon('shield')}</span></div><div className="metric-value">{findings.length.toString().padStart(2, '0')}</div><div className="metric-note">Across all imported scans</div></article>
+            <article className="metric-card"><div className="metric-top"><span>Total findings</span><span className="metric-icon violet">{icon('shield')}</span></div><div className="metric-value">{findings.length.toString().padStart(2, '0')}</div><div className="metric-note">Across connected repositories</div></article>
             <article className="metric-card"><div className="metric-top"><span>Need review</span><span className="metric-icon amber">!</span></div><div className="metric-value">{findings.filter(f => ['ai_error', 'uncertain', 'guard_rejected'].includes(f.status)).length.toString().padStart(2, '0')}</div><div className="metric-note">Require security team attention</div></article>
             <article className="metric-card"><div className="metric-top"><span>Patch success</span><span className="metric-icon green">✓</span></div><div className="metric-value">{patches.length ? `${Math.round(patches.filter(f => f.patch_status === 'fixed').length / patches.length * 100)}%` : '—'}</div><div className="metric-note">{patches.length ? `${patches.filter(f => f.patch_status === 'fixed').length} of ${patches.length} attempts fixed` : 'No patch attempts yet'}</div></article>
             <article className="metric-card"><div className="metric-top"><span>Repositories</span><span className="metric-icon blue">{icon('grid')}</span></div><div className="metric-value">{new Set(findings.map(f => f.repository).filter(Boolean)).size.toString().padStart(2, '0')}</div><div className="metric-note">With imported findings</div></article>
@@ -164,26 +248,26 @@ function App() {
               <div className="chart-foot">Patch success rate: {patches.length ? `${Math.round(patches.filter(f => f.patch_status === 'fixed').length / patches.length * 100)}%` : 'No attempts yet'}</div>
             </article>
           </section>
-          <section className="content-card repo-submit-card"><div className="repo-submit-copy"><span className="repo-submit-icon">{icon('arrow')}</span><div><h2>Scan a GitHub repository</h2><p>Paste a public repository URL to send it to your security scanning backend.</p></div></div><form className="repo-submit-form" onSubmit={submitRepository}><label className="repo-input-wrap"><span className="github-mark">GH</span><input type="url" value={repoUrl} onChange={e => setRepoUrl(e.target.value)} placeholder="https://github.com/owner/repository" aria-label="GitHub repository URL" required /></label><button className="button button-primary" disabled={repoBusy}>{repoBusy ? <><span className="spinner" /> Submitting…</> : 'Send to scanner'}</button></form>{repoError && <p className="repo-error" role="alert">{repoError}</p>}<div className="endpoint-note">Backend endpoint: <code>{import.meta.env.VITE_API_URL || 'http://localhost:8000/api/scan'}</code><span>·</span> Set <code>VITE_API_URL</code> to change it</div></section>
+          <section className="content-card repo-submit-card"><div className="repo-submit-copy"><span className="repo-submit-icon">{icon('arrow')}</span><div><h2>Scan a GitHub repository</h2><p>Submit a public GitHub URL. The backend makes a shallow local clone, then scans that checkout.</p></div></div><form className="repo-submit-form" onSubmit={submitRepository}><label className="repo-input-wrap"><span className="github-mark">GH</span><input type="url" value={repoUrl} onChange={e => setRepoUrl(e.target.value)} placeholder="https://github.com/owner/repository" aria-label="GitHub repository URL" required /></label><button className="button button-primary" disabled={repoBusy || backendStatus !== 'online'}>{repoBusy ? <><span className="spinner" /> Scanning…</> : 'Run security scan'}</button></form>{repoBusy && <p className="scan-progress" role="status">Cloning repository and running the local analysis. This can take a few minutes.</p>}{repoError && <p className="repo-error" role="alert">{repoError}</p>}<div className="endpoint-note">API <code>{import.meta.env.VITE_API_URL || 'Vite proxy → http://127.0.0.1:5001'}</code><span>·</span> The backend does not push changes or open pull requests from a scan.</div></section>
           </>}
           {section === 'findings' && <>
           <section className="findings-summary"><div><span>All findings</span><strong>{findings.length}</strong></div><div><span>Needs review</span><strong>{findings.filter(f => ['ai_error', 'uncertain', 'guard_rejected'].includes(f.status)).length}</strong></div><div><span>Patch attempts</span><strong>{patchAttemptsCount}</strong></div><div><span>Successfully patched</span><strong>{findings.filter(f => f.patch_status === 'fixed').length}</strong></div></section>
           <section className="content-card findings-card">
             <div className="card-heading"><div><h2>All vulnerabilities</h2><p>Filter and inspect imported security findings</p></div></div>
             <div className="filters"><label className="search-box">{icon('search')}<input value={query} onChange={e => setQuery(e.target.value)} placeholder="Search findings, IDs, repositories..." /></label><select aria-label="Filter severity" value={severity} onChange={e => setSeverity(e.target.value)}><option value="all">All severities</option>{['critical', 'high', 'medium', 'low'].map(v => <option key={v} value={v}>{v[0].toUpperCase() + v.slice(1)}</option>)}</select><select aria-label="Filter status" value={status} onChange={e => setStatus(e.target.value)}><option value="all">All statuses</option>{['confirmed', 'not_applicable', 'uncertain', 'ai_error', 'guard_rejected'].map(v => <option key={v} value={v}>{pretty(v)}</option>)}</select></div>
-            <div className="table-wrap"><table><thead><tr><th>VULNERABILITY</th><th>SEVERITY</th><th>AI REVIEW</th><th>PATCH STATUS</th><th>REPOSITORY</th><th>LAST DETECTED</th><th /></tr></thead><tbody>{filtered.map(f => <tr key={f.threat_id} onClick={() => setActive(f)} tabIndex={0} onKeyDown={e => e.key === 'Enter' && setActive(f)}><td><div className="finding-title">{f.title}</div><div className="finding-id">{f.cve || f.threat_id}</div></td><td><span className={`severity severity-${f.severity.toLowerCase()}`}><i />{pretty(f.severity)}</span></td><td><span className={`status status-${f.status}`}>{pretty(f.status)}</span></td><td>{f.patch_status ? <span className={`status status-${f.patch_status}`}>{pretty(f.patch_status)}</span> : <span className="muted">Not attempted</span>}</td><td><span className="repo-name">{f.repository.split(/[\\/]/).filter(Boolean).pop() || 'Unknown repository'}</span></td><td className="date-cell">{date(f.timestamp)}</td><td>{icon('chevron')}</td></tr>)}</tbody></table>{filtered.length === 0 && <div className="empty-state">{findings.length ? 'No findings match these filters.' : 'No findings yet. Import a JSON scan to get started.'}</div>}</div>
+            <div className="table-wrap"><table><thead><tr><th>VULNERABILITY</th><th>SEVERITY</th><th>AI REVIEW</th><th>PATCH STATUS</th><th>REPOSITORY</th><th>LAST DETECTED</th><th>PATCH ACTION</th></tr></thead><tbody>{filtered.map(f => <tr key={`${f.repository}:${f.threat_id}`} onClick={() => setActive(f)} tabIndex={0} onKeyDown={e => e.key === 'Enter' && setActive(f)}><td><div className="finding-title">{f.title}</div><div className="finding-id">{f.cve || f.threat_id}</div></td><td><span className={`severity severity-${f.severity.toLowerCase()}`}><i />{pretty(f.severity)}</span></td><td><span className={`status status-${f.status}`}>{pretty(f.status)}</span></td><td>{f.patch_status ? <span className={`status status-${f.patch_status}`}>{pretty(f.patch_status)}</span> : <span className="muted">Not attempted</span>}</td><td><span className="repo-name">{f.repository.split(/[\\/]/).filter(Boolean).pop() || 'Unknown repository'}</span></td><td className="date-cell">{date(f.timestamp)}</td><td>{f.patch_status !== 'fixed' && f.patch_available && f.status !== 'guard_rejected' ? <button className="button button-primary row-patch-button" disabled={fixBusy || backendStatus !== 'online'} onClick={event => { event.stopPropagation(); void submitFix(f) }}>{fixBusy ? 'Working…' : f.status === 'confirmed' ? f.patch_status === 'unresolved' ? 'Retry patch' : 'Start patch' : 'Recheck & patch'}</button> : f.status === 'guard_rejected' ? <span className="muted" title="Guard-rejected findings cannot enter the patch workflow">Guard blocked</span> : ['confirmed', 'ai_error', 'uncertain', 'not_applicable'].includes(f.status) && f.patch_status !== 'fixed' ? <span className="muted" title="Run a fresh scan with this backend to recheck this finding">Rescan to enable</span> : <span className="muted">—</span>}</td></tr>)}</tbody></table>{filtered.length === 0 && <div className="empty-state">{findings.length ? 'No findings match these filters.' : 'No findings yet. Import a JSON scan to get started.'}</div>}</div>
             <div className="table-footer">Showing <strong>{filtered.length}</strong> of <strong>{findings.length}</strong> findings<span>Data stored locally in this browser</span></div>
           </section>
           </>}
           {section === 'overview' && <div className="bottom-grid"><section className="content-card source-card"><div className="card-heading"><div><h2>Latest scan</h2><p>Most recently imported finding</p></div><span className="scan-icon">{icon('file')}</span></div>{findings[0] ? <><div className="scan-title">{findings[0].title}</div><div className="scan-meta"><span className="live-dot" />{date(findings[0].timestamp)}</div><div className="source-url"><span>Source</span><a href={findings[0].source.url} target="_blank" rel="noreferrer">{findings[0].source.url}{icon('arrow')}</a></div><div className="scan-footer"><span>Finding ID</span><code>{findings[0].threat_id}</code></div></> : <div className="empty-mini">Import a scan to see its source details.</div>}</section>
-            <section className="content-card activity-card"><div className="card-heading"><div><h2>Remediation activity</h2><p>Recent patch outcomes</p></div><button className="text-button" onClick={() => setSection('history')}>History <span>→</span></button></div>{patches.length ? <div className="activity-list">{patches.slice(0, 3).map(f => <button key={f.threat_id} className="activity-row" onClick={() => setActive(f)}><span className={`activity-mark ${f.patch_status}`}>{f.patch_status === 'fixed' ? '✓' : '!'}</span><span className="activity-copy"><strong>{f.title}</strong><small>{f.branch || f.threat_id}</small></span><span className={`status status-${f.patch_status}`}>{pretty(f.patch_status || '')}</span></button>)}</div> : <div className="activity-empty"><span className="empty-clock">{icon('clock')}</span><span><strong>No patch history yet</strong><small>Patch attempts and final audit results will appear here.</small></span></div>}</section></div>}
+            <section className="content-card activity-card"><div className="card-heading"><div><h2>Agent activity</h2><p>Latest Guard and Offline engine events</p></div><button className="text-button" onClick={() => setSection('history')}>Patch history <span>→</span></button></div>{backendEvents.length ? <div className="event-list">{backendEvents.slice(0, 5).map((event, index) => <div className="event-row" key={`${event.timestamp}-${event.component}-${index}`}><span className={`event-dot event-${event.status.toLowerCase()}`} /><span className="event-copy"><strong>{pretty(event.event)}</strong><small>{event.component}{event.details ? ` · ${event.details}` : ''}</small></span><time>{date(event.timestamp)}</time></div>)}</div> : <div className="activity-empty"><span className="empty-clock">{icon('clock')}</span><span><strong>No backend activity yet</strong><small>Guard and Offline events appear here after a repository scan.</small></span></div>}</section></div>}
         </>}
-        {section === 'history' && <section className="content-card history-card"><div className="card-heading"><div><h2>Remediation attempts</h2><p>Patch status and final audit from imported scan results</p></div></div>{patches.length ? <div className="history-list">{patches.map(f => <button className="history-row" key={f.threat_id} onClick={() => setActive(f)}><span className={`activity-mark ${f.patch_status}`}>{f.patch_status === 'fixed' ? '✓' : '!'}</span><span><strong>{f.title}</strong><small>{f.branch || f.threat_id} · {f.patch_attempts} attempt{f.patch_attempts === 1 ? '' : 's'}</small></span><span className="history-audit">Audit: {f.final_audit ? pretty(f.final_audit) : 'Pending'}</span><span className={`status status-${f.patch_status}`}>{pretty(f.patch_status || '')}</span></button>)}</div> : <div className="empty-state history-empty">No previous patches found. When a scan includes a patch attempt, its branch, diff, attempts, and final audit will be recorded here.</div>}</section>}
-        <footer className="page-footer"><span>SentinelAudit <span>·</span> Security findings workspace</span><span>Local data <i /> All changes saved</span></footer>
+        {section === 'history' && <section className="content-card history-card"><div className="card-heading"><div><h2>Remediation attempts</h2><p>Patch history persists across future scans</p></div></div>{patchHistory.length ? <div className="history-list">{patchHistory.map(f => <button className="history-row" key={`${f.repository}:${f.threat_id}:${f.timestamp}`} onClick={() => setActive(f)}><span className={`activity-mark ${f.patch_status}`}>{f.patch_status === 'fixed' ? '✓' : '!'}</span><span><strong>{f.title}</strong><small>{f.branch || f.threat_id} · {f.patch_attempts} attempt{f.patch_attempts === 1 ? '' : 's'} · {date(f.timestamp)}</small></span><span className="history-audit">Audit: {finalAuditLabel(f.final_audit)}</span><span className={`status status-${f.patch_status}`}>{pretty(f.patch_status || '')}</span></button>)}</div> : <div className="empty-state history-empty">No previous patches found. When a scan includes a patch attempt, its branch, diff, attempts, and final audit will be recorded here.</div>}</section>}
+        <footer className="page-footer"><span>SentinelAudit <span>·</span> Security findings workspace</span><span>{backendStatus === 'online' ? 'Synced with backend' : 'Showing saved browser data'} <i className={`backend-${backendStatus}`} /></span></footer>
       </div>
     </main>
 
-    {active && <div className="modal-backdrop" onMouseDown={e => e.target === e.currentTarget && setActive(null)}><aside className="detail-panel" role="dialog" aria-modal="true" aria-label={`Finding details: ${active.title}`}><div className="detail-header"><div><div className="eyebrow">VULNERABILITY DETAIL</div><h2>{active.title}</h2></div><button className="icon-button" aria-label="Close details" onClick={() => setActive(null)}>{icon('close')}</button></div><div className="detail-scroll"><div className="detail-badges"><span className={`severity severity-${active.severity.toLowerCase()}`}><i />{pretty(active.severity)}</span><span className={`status status-${active.status}`}>{pretty(active.status)}</span></div><div className="detail-id">{active.threat_id}</div><section className="detail-section"><h3>Finding overview</h3><dl><div><dt>Attack type</dt><dd>{pretty(active.attack_type)}</dd></div><div><dt>CVE</dt><dd>{active.cve || 'Not assigned'}</dd></div><div><dt>Confidence</dt><dd>{Math.round(active.confidence * 100)}%</dd></div><div><dt>Repository</dt><dd className="wrap-value">{active.repository || '—'}</dd></div><div><dt>Detected</dt><dd>{date(active.timestamp)}</dd></div></dl></section><section className="detail-section"><h3>Source</h3><dl><div><dt>Type</dt><dd>{pretty(active.source?.type || 'unknown')}</dd></div><div><dt>Published</dt><dd>{date(active.source?.published)}</dd></div><div><dt>Retrieved</dt><dd>{date(active.source?.retrieved_at)}</dd></div></dl><a className="detail-link" href={active.source?.url} target="_blank" rel="noreferrer">{active.source?.url || 'No source URL'} {icon('arrow')}</a></section><section className="detail-section"><h3>Reverse engineering</h3><p className="detail-paragraph">{active.vulnerability_hypothesis || 'No hypothesis provided.'}</p>{active.reason && <div className="reason-box"><strong>Review note</strong><p>{active.reason}</p></div>}<div className="recommendation"><strong>Recommended fix</strong><p>{active.recommended_fix || 'No recommendation provided.'}</p></div></section><section className="detail-section"><h3>Affected areas</h3>{active.affected_files?.length ? <ul className="file-list">{active.affected_files.map((file, i) => <li key={file}>{icon('file')}<span>{file}</span>{active.affected_lines?.[i] && <code>:{active.affected_lines[i]}</code>}</li>)}</ul> : <p className="muted detail-paragraph">No affected files or lines were reported.</p>}{active.security_test_path && <div className="test-path">Security test <code>{active.security_test_path}</code></div>}</section><section className="detail-section"><h3>Patching result</h3><dl><div><dt>Status</dt><dd>{active.patch_status ? pretty(active.patch_status) : 'Not attempted'}</dd></div><div><dt>Attempts</dt><dd>{active.patch_attempts}</dd></div><div><dt>Branch</dt><dd className="wrap-value">{active.branch || '—'}</dd></div><div><dt>Final audit</dt><dd>{active.final_audit ? pretty(active.final_audit) : '—'}</dd></div></dl>{active.diff ? <pre className="diff-block">{active.diff}</pre> : <p className="muted detail-paragraph">No patch diff available.</p>}{Object.entries(active.code || {}).map(([path, value]) => <div className="code-change" key={path}><strong>{path}</strong><pre>{value.before}{value.after ? `\n\nAfter:\n${value.after}` : ''}</pre></div>)}</section></div></aside></div>}
+    {active && <div className="modal-backdrop" onMouseDown={e => e.target === e.currentTarget && setActive(null)}><aside className="detail-panel" role="dialog" aria-modal="true" aria-label={`Finding details: ${active.title}`}><div className="detail-header"><div><div className="eyebrow">VULNERABILITY DETAIL</div><h2>{active.title}</h2></div><button className="icon-button" aria-label="Close details" onClick={() => { setActive(null); setFixError('') }}>{icon('close')}</button></div><div className="detail-scroll"><div className="detail-badges"><span className={`severity severity-${active.severity.toLowerCase()}`}><i />{pretty(active.severity)}</span><span className={`status status-${active.status}`}>{pretty(active.status)}</span></div><div className="detail-id">{active.threat_id}</div><section className="detail-section"><h3>Finding overview</h3><dl><div><dt>Attack type</dt><dd>{pretty(active.attack_type)}</dd></div><div><dt>CVE</dt><dd>{active.cve || 'Not assigned'}</dd></div><div><dt>Confidence</dt><dd>{Math.round((active.confidence ?? 0) * 100)}%</dd></div><div><dt>Repository</dt><dd className="wrap-value">{active.repository || '—'}</dd></div><div><dt>Detected</dt><dd>{date(active.timestamp)}</dd></div></dl></section><section className="detail-section"><h3>Source</h3><dl><div><dt>Type</dt><dd>{pretty(active.source?.type || 'unknown')}</dd></div><div><dt>Published</dt><dd>{date(active.source?.published)}</dd></div><div><dt>Retrieved</dt><dd>{date(active.source?.retrieved_at)}</dd></div></dl><a className="detail-link" href={active.source?.url} target="_blank" rel="noreferrer">{active.source?.url || 'No source URL'} {icon('arrow')}</a></section><section className="detail-section"><h3>Reverse engineering</h3><p className="detail-paragraph">{active.vulnerability_hypothesis || 'No hypothesis provided.'}</p>{active.reason && <div className="reason-box"><strong>Review note</strong><p>{active.reason}</p></div>}<div className="recommendation"><strong>Recommended fix</strong><p>{active.recommended_fix || 'No recommendation provided.'}</p></div></section><section className="detail-section"><h3>Affected areas</h3>{active.affected_files?.length ? <ul className="file-list">{active.affected_files.map((file, i) => <li key={file}>{icon('file')}<span>{file}</span>{active.affected_lines?.[i] && <code>:{active.affected_lines[i]}</code>}</li>)}</ul> : <p className="muted detail-paragraph">No affected files or lines were reported.</p>}{active.security_test_path && <div className="test-path">Security test <code>{active.security_test_path}</code></div>}</section><section className="detail-section"><h3>Patching result</h3><dl><div><dt>Status</dt><dd>{active.patch_status ? pretty(active.patch_status) : 'Not attempted'}</dd></div><div><dt>Attempts</dt><dd>{active.patch_attempts}</dd></div><div><dt>Branch</dt><dd className="wrap-value">{active.branch || '—'}</dd></div><div><dt>Final audit</dt><dd>{finalAuditLabel(active.final_audit)}</dd></div></dl>{active.final_audit && typeof active.final_audit === 'object' && <div className="reason-box"><strong>Final audit reasoning</strong><p>{active.final_audit.reasoning || active.final_audit.recommendation || 'No additional audit details.'}</p></div>}{active.diff ? <pre className="diff-block">{active.diff}</pre> : <p className="muted detail-paragraph">No patch diff available.</p>}{Object.entries(active.code || {}).map(([path, value]) => <div className="code-change" key={path}><strong>{path}</strong><pre>{value.before}{value.after ? `\n\nAfter:\n${value.after}` : ''}</pre></div>)}{active.status === 'guard_rejected' ? <p className="reason-box">The Guard rejected this finding, so it cannot enter the patch workflow.</p> : active.patch_status !== 'fixed' && (active.patch_available ? <div className="fix-controls"><button className="button button-primary" onClick={() => void submitFix(active)} disabled={fixBusy || backendStatus !== 'online'}>{fixBusy ? <><span className="spinner" /> Rechecking &amp; patching…</> : active.status === 'confirmed' ? active.patch_status === 'unresolved' ? 'Approve retry patch' : 'Approve & run patch workflow' : 'Recheck & patch'}</button><p>{active.status === 'confirmed' ? 'The backend creates a local fix branch only after tests and audit pass. Nothing is pushed.' : 'The backend repeats the security audit first. It starts patching only if the new audit confirms the vulnerability.'}</p>{fixError && <p className="repo-error" role="alert">{fixError}</p>}</div> : ['confirmed', 'ai_error', 'uncertain', 'not_applicable'].includes(active.status) && active.patch_status !== 'fixed' ? <p className="reason-box">Run a fresh scan with this backend to enable rechecking this finding.</p> : null)}</section></div></aside></div>}
   </div>
 }
 
