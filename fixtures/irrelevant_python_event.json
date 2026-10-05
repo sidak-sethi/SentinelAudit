@@ -1,0 +1,12 @@
+{
+  "event_id": "fixture:CVE-2099-0002",
+  "source": "fixture",
+  "source_type": "fixture",
+  "identifiers": {"CVE": ["CVE-2099-0002"]},
+  "affected_technology": ["Linux kernel"],
+  "affected_packages": ["linux"],
+  "summary": "Synthetic kernel issue",
+  "description": "Not relevant to the Python ecosystem.",
+  "evidence": [{"type": "fixture"}],
+  "references": []
+}

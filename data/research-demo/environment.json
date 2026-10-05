@@ -1,0 +1,14 @@
+{
+  "python_version": "3.11",
+  "os_base": "python:3.11-slim",
+  "package_version": "1.0.0",
+  "dependency_versions": {},
+  "configuration": {},
+  "environment_variables": [],
+  "network_policy": "disabled",
+  "resource_limits": {
+    "cpu": 1.0,
+    "memory_mb": 512,
+    "pids": 64
+  }
+}

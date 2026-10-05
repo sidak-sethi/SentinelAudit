@@ -1,0 +1,17 @@
+{
+  "reproduce_command": [
+    "python",
+    "attack.py"
+  ],
+  "apply_patch_command": [
+    "python",
+    "apply_patch.py"
+  ],
+  "regression_command": [
+    "python",
+    "regression.py"
+  ],
+  "expected_behavior": "VULNERABLE",
+  "patched_expected_behavior": "SAFE",
+  "success_exit_code": 0
+}
